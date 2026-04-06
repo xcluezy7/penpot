@@ -539,7 +539,7 @@ impl Surfaces {
         tile: &Tile,
         tile_rect: &skia::Rect,
         scale_bits: u32,
-    ) {
+    ) -> Option<skia::Image> {
         let rect = IRect::from_xywh(
             self.margins.width,
             self.margins.height,
@@ -558,8 +558,12 @@ impl Surfaces {
                 &skia::Paint::default(),
             );
 
-            self.tiles.add(tile_viewbox, tile, scale_bits, tile_image);
+            // `skia::Image` is ref-counted; cloning is cheap.
+            self.tiles
+                .add(tile_viewbox, tile, scale_bits, tile_image.clone());
+            return Some(tile_image);
         }
+        None
     }
 
     pub fn has_cached_tile_surface(&self, tile: Tile, scale_bits: u32) -> bool {

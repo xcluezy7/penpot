@@ -855,19 +855,39 @@ impl RenderState {
 
     pub fn apply_render_to_final_canvas(&mut self, rect: skia::Rect) -> Result<()> {
         let tile_rect = self.get_current_aligned_tile_bounds()?;
-        let scale_bits = self.get_scale().to_bits();
-        self.surfaces.cache_current_tile_texture(
+        let scale = self.get_scale();
+        let scale_bits = scale.to_bits();
+        let tile = self
+            .current_tile
+            .ok_or(Error::CriticalError("Current tile not found".to_string()))?;
+        let rendered_tile_image = self.surfaces.cache_current_tile_texture(
             &self.tile_viewbox,
-            &self
-                .current_tile
-                .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
+            &tile,
             &tile_rect,
             scale_bits,
         );
 
+        // Bootstrap / keep 100% cache warm: whenever we finish a full-quality tile render at
+        // a zoom != 100%, reproject that tile into the corresponding 100% tiles.
+        // This lets fast_mode rely on 100% even if the file opened at 60%, etc.
+        if !self.options.is_fast_mode() {
+            if let Some(img) = rendered_tile_image.as_ref() {
+                let base_bits = self.base_zoom_placeholder_scale_bits();
+                if base_bits != scale_bits {
+                    self.surfaces.reproject_cached_tile_into_scale(
+                        &self.tile_viewbox,
+                        img,
+                        tile,
+                        scale_bits,
+                        base_bits,
+                        self.background_color,
+                    );
+                }
+            }
+        }
+
         self.surfaces.draw_cached_tile_surface(
-            self.current_tile
-                .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
+            tile,
             scale_bits,
             rect,
             self.background_color,
