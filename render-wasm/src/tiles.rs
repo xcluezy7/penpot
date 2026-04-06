@@ -261,7 +261,14 @@ impl PendingTiles {
         result
     }
 
-    pub fn update(&mut self, tile_viewbox: &TileViewbox, surfaces: &Surfaces, scale_bits: u32) {
+    pub fn update(
+        &mut self,
+        tile_viewbox: &TileViewbox,
+        surfaces: &Surfaces,
+        current_scale: f32,
+        fast_mode: bool,
+        lookup_scale_bits: u32,
+    ) {
         self.list.clear();
 
         // Generate spiral for the interest area (viewport + margin)
@@ -279,7 +286,14 @@ impl PendingTiles {
 
         for tile in spiral {
             let is_visible = tile_viewbox.visible_rect.contains(&tile);
-            let is_cached = surfaces.has_cached_tile_surface(tile, scale_bits);
+            let is_cached = if fast_mode {
+                // fast_mode reads only 100% zoom cache; tile indices differ across scales,
+                // so decide cacheability by world rect coverage at the lookup scale.
+                let world_rect = super::tiles::get_tile_rect(tile, current_scale);
+                surfaces.world_rect_has_any_tile_at_scale_bits(world_rect, lookup_scale_bits)
+            } else {
+                surfaces.has_cached_tile_surface(tile, lookup_scale_bits)
+            };
 
             match (is_visible, is_cached) {
                 (true, true) => visible_cached.push(tile),

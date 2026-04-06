@@ -422,6 +422,21 @@ impl RenderState {
         })
     }
 
+    /// Device scale when workspace zoom is 100% (`viewbox.zoom == 1`): `1.0 * dpr`.
+    fn base_zoom_placeholder_scale_bits(&self) -> u32 {
+        (1.0_f32 * self.options.dpr()).to_bits()
+    }
+
+    /// Scale bits used to look up tile textures in the cache.
+    /// In `fast_mode`, always use the 100% zoom cache; otherwise use current scale.
+    fn tile_texture_cache_lookup_scale_bits(&self) -> u32 {
+        if self.options.is_fast_mode() {
+            self.base_zoom_placeholder_scale_bits()
+        } else {
+            self.get_scale().to_bits()
+        }
+    }
+
     fn rect_union(a: Rect, b: Rect) -> Rect {
         Rect::from_ltrb(
             a.left().min(b.left()),
@@ -1489,6 +1504,9 @@ impl RenderState {
                                 target_world_rect,
                                 current_scale,
                                 current_scale_bits,
+                                self.options
+                                    .is_fast_mode()
+                                    .then_some(self.base_zoom_placeholder_scale_bits()),
                                 true,
                             );
                         }
@@ -1576,9 +1594,14 @@ impl RenderState {
 
         let _tile_start = performance::begin_timed_log!("tile_cache_update");
         performance::begin_measure!("tile_cache");
-        let scale_bits = scale.to_bits();
-        self.pending_tiles
-            .update(&self.tile_viewbox, &self.surfaces, scale_bits);
+        let lookup_bits = self.tile_texture_cache_lookup_scale_bits();
+        self.pending_tiles.update(
+            &self.tile_viewbox,
+            &self.surfaces,
+            scale,
+            self.options.is_fast_mode(),
+            lookup_bits,
+        );
         performance::end_measure!("tile_cache");
         performance::end_timed_log!("tile_cache_update", _tile_start);
 
@@ -2612,16 +2635,14 @@ impl RenderState {
         while !should_stop {
             if let Some(current_tile) = self.current_tile {
                 let scale = self.get_scale();
-                let scale_bits = scale.to_bits();
-                if self
-                    .surfaces
-                    .has_cached_tile_surface(current_tile, scale_bits)
-                {
+                let lookup_bits = self.tile_texture_cache_lookup_scale_bits();
+                let fast_mode = self.options.is_fast_mode();
+                if !fast_mode && self.surfaces.has_cached_tile_surface(current_tile, lookup_bits) {
                     performance::begin_measure!("render_shape_tree::cached");
                     let tile_rect = self.get_current_tile_bounds()?;
                     self.surfaces.draw_cached_tile_surface(
                         current_tile,
-                        scale_bits,
+                        lookup_bits,
                         tile_rect,
                         self.background_color,
                     );
@@ -2646,7 +2667,8 @@ impl RenderState {
                         self.background_color,
                         target_world_rect,
                         scale,
-                        scale_bits,
+                        lookup_bits,
+                        fast_mode.then_some(self.base_zoom_placeholder_scale_bits()),
                         true,
                     );
                     performance::begin_measure!("render_shape_tree::uncached");

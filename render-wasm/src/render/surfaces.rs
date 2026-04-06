@@ -566,6 +566,24 @@ impl Surfaces {
         self.tiles.has(tile, scale_bits)
     }
 
+    pub fn world_rect_has_any_tile_at_scale_bits(&self, world_rect: Rect, scale_bits: u32) -> bool {
+        let scale = f32::from_bits(scale_bits);
+        if !scale.is_finite() || scale <= 0.0 {
+            return false;
+        }
+        let tile_size_world = super::tiles::get_tile_size(scale);
+        let super::tiles::TileRect(sx, sy, ex, ey) =
+            super::tiles::get_tiles_for_rect(world_rect, tile_size_world);
+        for x in sx..=ex {
+            for y in sy..=ey {
+                if self.tiles.has_stale(Tile::from(x, y), scale_bits) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn cached_scale_bits(&self) -> Vec<u32> {
         self.tiles.scale_bits().collect()
     }
@@ -670,6 +688,7 @@ impl Surfaces {
     }
 
     /// Draw a placeholder for a missing tile using cached tiles from other zoom levels.
+    /// If `forced_src_scale_bits` is set, only that scale is used as the source (used by fast_mode).
     pub fn draw_tile_fallback_cross_zoom(
         &mut self,
         tile_viewbox: &TileViewbox,
@@ -678,12 +697,15 @@ impl Surfaces {
         target_world_rect: Rect,
         target_scale: f32,
         target_scale_bits: u32,
+        forced_src_scale_bits: Option<u32>,
         debug_trace: bool,
     ) -> usize {
-        let Some(candidate_scale_bits) = self
-            .tiles
-            .best_fallback_scale_bits(target_scale, target_scale_bits)
-        else {
+        let Some(candidate_scale_bits) = (if let Some(bits) = forced_src_scale_bits {
+            Some(bits)
+        } else {
+            self.tiles
+                .best_fallback_scale_bits(target_scale, target_scale_bits)
+        }) else {
             if debug_trace {
             }
             return 0;
@@ -706,7 +728,12 @@ impl Surfaces {
         for x in sx..=ex {
             for y in sy..=ey {
                 let src_tile = Tile::from(x, y);
-                let Some(src_image) = self.tiles.get(src_tile, candidate_scale_bits) else {
+                let src_image_opt = if forced_src_scale_bits.is_some() {
+                    self.tiles.get_stale(src_tile, candidate_scale_bits)
+                } else {
+                    self.tiles.get(src_tile, candidate_scale_bits)
+                };
+                let Some(src_image) = src_image_opt else {
                     continue;
                 };
 
@@ -833,6 +860,12 @@ impl TileTextureCache {
         self.grid.contains_key(&key) && !self.removed.contains(&key)
     }
 
+    /// Like `has` but ignores the `removed` tombstone (stale placeholder).
+    pub fn has_stale(&self, tile: Tile, scale_bits: u32) -> bool {
+        let key = TileCacheKey { tile, scale_bits };
+        self.grid.contains_key(&key)
+    }
+
     fn gc(&mut self) {
         println!("gc");
         // Make a real remove
@@ -893,6 +926,12 @@ impl TileTextureCache {
         if self.removed.contains(&key) {
             return None;
         }
+        self.grid.get(&key)
+    }
+
+    /// Like `get` but returns the image even if it is marked as `removed`.
+    pub fn get_stale(&self, tile: Tile, scale_bits: u32) -> Option<&skia::Image> {
+        let key = TileCacheKey { tile, scale_bits };
         self.grid.get(&key)
     }
 
