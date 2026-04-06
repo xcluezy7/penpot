@@ -566,6 +566,10 @@ impl Surfaces {
         self.tiles.has(tile, scale_bits)
     }
 
+    pub fn has_cached_tile_surface_stale_ok(&self, tile: Tile, scale_bits: u32) -> bool {
+        self.tiles.has_stale(tile, scale_bits)
+    }
+
     pub fn world_rect_has_any_tile_at_scale_bits(&self, world_rect: Rect, scale_bits: u32) -> bool {
         let scale = f32::from_bits(scale_bits);
         if !scale.is_finite() || scale <= 0.0 {
@@ -615,6 +619,81 @@ impl Surfaces {
             self.target
                 .canvas()
                 .draw_image_rect(image, None, rect, &skia::Paint::default());
+        }
+    }
+
+    pub fn cached_tile_image(&self, tile: Tile, scale_bits: u32) -> Option<skia::Image> {
+        self.tiles.get(tile, scale_bits).cloned()
+    }
+
+    pub fn reproject_cached_tile_into_scale(
+        &mut self,
+        tile_viewbox: &TileViewbox,
+        src_image: &skia::Image,
+        src_tile: Tile,
+        src_scale_bits: u32,
+        dst_scale_bits: u32,
+        background: skia::Color,
+    ) {
+        let src_scale = f32::from_bits(src_scale_bits);
+        let dst_scale = f32::from_bits(dst_scale_bits);
+        if !src_scale.is_finite() || src_scale <= 0.0 || !dst_scale.is_finite() || dst_scale <= 0.0 {
+            return;
+        }
+
+        let src_world_rect = super::tiles::get_tile_rect(src_tile, src_scale);
+
+        let dst_tile_size_world = super::tiles::get_tile_size(dst_scale);
+        let super::tiles::TileRect(sx, sy, ex, ey) =
+            super::tiles::get_tiles_for_rect(src_world_rect, dst_tile_size_world);
+
+        for x in sx..=ex {
+            for y in sy..=ey {
+                let dst_tile = Tile::from(x, y);
+                let dst_world_rect = super::tiles::get_tile_rect(dst_tile, dst_scale);
+                let Some(overlap_world) = Self::rect_intersection(src_world_rect, dst_world_rect) else {
+                    continue;
+                };
+
+                let src_px_l = (overlap_world.left() - src_world_rect.left()) * src_scale;
+                let src_px_t = (overlap_world.top() - src_world_rect.top()) * src_scale;
+                let src_px_r = (overlap_world.right() - src_world_rect.left()) * src_scale;
+                let src_px_b = (overlap_world.bottom() - src_world_rect.top()) * src_scale;
+                let src_rect = Rect::from_ltrb(src_px_l, src_px_t, src_px_r, src_px_b);
+
+                let dst_px_l = (overlap_world.left() - dst_world_rect.left()) * dst_scale;
+                let dst_px_t = (overlap_world.top() - dst_world_rect.top()) * dst_scale;
+                let dst_px_r = (overlap_world.right() - dst_world_rect.left()) * dst_scale;
+                let dst_px_b = (overlap_world.bottom() - dst_world_rect.top()) * dst_scale;
+                let dst_rect = Rect::from_ltrb(dst_px_l, dst_px_t, dst_px_r, dst_px_b);
+
+                let mut tile_surface = match self
+                    .current
+                    .new_surface_with_dimensions((TILE_SIZE as i32, TILE_SIZE as i32))
+                {
+                    Some(s) => s,
+                    None => return,
+                };
+                // IMPORTANT: compose over existing dst tile image to avoid erasing
+                // regions not covered by this reprojection patch.
+                tile_surface.canvas().clear(background);
+                if let Some(existing) = self.tiles.get_stale(dst_tile, dst_scale_bits) {
+                    tile_surface.canvas().draw_image_rect(
+                        existing,
+                        None,
+                        Rect::from_xywh(0.0, 0.0, TILE_SIZE, TILE_SIZE),
+                        &skia::Paint::default(),
+                    );
+                }
+                tile_surface.canvas().draw_image_rect(
+                    src_image,
+                    Some((&src_rect, skia::canvas::SrcRectConstraint::Fast)),
+                    dst_rect,
+                    &skia::Paint::default(),
+                );
+                let new_img = tile_surface.image_snapshot();
+                self.tiles.add(tile_viewbox, &dst_tile, dst_scale_bits, new_img);
+            }
         }
     }
 

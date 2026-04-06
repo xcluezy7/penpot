@@ -336,6 +336,12 @@ pub(crate) struct RenderState {
     pub show_grid: Option<Uuid>,
     pub focus_mode: FocusMode,
     pub touched_ids: HashSet<Uuid>,
+    /// When true, finishing a full-quality render at a zoom != 100% should schedule
+    /// a non-blocking refresh of the 100% tile cache from the rendered tiles.
+    base_cache_refresh_pending: bool,
+    /// Queue of tiles (at `base_cache_refresh_src_scale_bits`) to reproject into 100%.
+    base_cache_refresh_queue: Vec<tiles::Tile>,
+    base_cache_refresh_src_scale_bits: u32,
     shape_last_extrect_by_scale: HashMap<ShapeScaleKey, Rect>,
     /// Temporary flag used for off-screen passes (drop-shadow masks, filter surfaces, etc.)
     /// where we must render shapes without inheriting ancestor layer blurs. Toggle it through
@@ -366,6 +372,89 @@ pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
 }
 
 impl RenderState {
+    fn schedule_base_cache_refresh_from_full_render(&mut self, src_scale_bits: u32) {
+        let base_bits = self.base_zoom_placeholder_scale_bits();
+        if src_scale_bits == base_bits {
+            self.base_cache_refresh_pending = false;
+            self.base_cache_refresh_queue.clear();
+            self.base_cache_refresh_src_scale_bits = 0;
+            println!("base-cache(100%) refresh skipped (already at 100%)");
+            return;
+        }
+        // Schedule only tiles we actually have at src scale (interest area).
+        let scale = f32::from_bits(src_scale_bits);
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let tiles::TileRect(sx, sy, ex, ey) = tiles::get_tiles_for_viewbox_with_interest(
+            self.viewbox,
+            VIEWPORT_INTEREST_AREA_THRESHOLD,
+            scale,
+        );
+        self.base_cache_refresh_queue.clear();
+        for x in sx..=ex {
+            for y in sy..=ey {
+                let t = tiles::Tile::from(x, y);
+                if self.surfaces.has_cached_tile_surface(t, src_scale_bits) {
+                    self.base_cache_refresh_queue.push(t);
+                }
+            }
+        }
+        self.base_cache_refresh_src_scale_bits = src_scale_bits;
+
+        if self.base_cache_refresh_queue.is_empty() {
+            // Nothing to reproject from this full render.
+            self.base_cache_refresh_pending = false;
+            // Mark as "scheduled" (so we don't treat it as never started).
+            // Keep src bits set so `process_base_cache_refresh_batch` can report completion consistently.
+            println!(
+                "base-cache(100%) refresh done (empty queue, src_scale_bits={})",
+                src_scale_bits
+            );
+        } else {
+            println!(
+                "base-cache(100%) refresh scheduled: {} tiles (src_scale_bits={})",
+                self.base_cache_refresh_queue.len(),
+                src_scale_bits
+            );
+        }
+    }
+
+    fn process_base_cache_refresh_batch(&mut self, max_tiles: usize) {
+        // If we haven't scheduled yet (src bits = 0), do nothing: we are waiting for a full render
+        // at a non-100% zoom to populate the queue.
+        if self.base_cache_refresh_src_scale_bits == 0 {
+            return;
+        }
+
+        if self.base_cache_refresh_queue.is_empty() {
+            // Queue completed (or was empty but we already reported in schedule()).
+            // Reset src bits to avoid repeatedly printing.
+            self.base_cache_refresh_pending = false;
+            self.base_cache_refresh_src_scale_bits = 0;
+            println!("base-cache(100%) refresh done (queue already empty)");
+            return;
+        }
+        let base_bits = self.base_zoom_placeholder_scale_bits();
+        let src_bits = self.base_cache_refresh_src_scale_bits;
+        for _ in 0..max_tiles {
+            let Some(tile) = self.base_cache_refresh_queue.pop() else { break };
+            let Some(img) = self.surfaces.cached_tile_image(tile, src_bits) else { continue };
+            self.surfaces.reproject_cached_tile_into_scale(
+                &self.tile_viewbox,
+                &img,
+                tile,
+                src_bits,
+                base_bits,
+                self.background_color,
+            );
+        }
+        if self.base_cache_refresh_queue.is_empty() {
+            self.base_cache_refresh_pending = false;
+            self.base_cache_refresh_src_scale_bits = 0;
+            println!("base-cache(100%) refresh done (src_scale_bits={})", src_bits);
+        }
+    }
     pub fn try_new(width: i32, height: i32) -> Result<RenderState> {
         // This needs to be done once per WebGL context.
         let mut gpu_state = GpuState::try_new()?;
@@ -415,6 +504,9 @@ impl RenderState {
             show_grid: None,
             focus_mode: FocusMode::new(),
             touched_ids: HashSet::default(),
+            base_cache_refresh_pending: false,
+            base_cache_refresh_queue: Vec::new(),
+            base_cache_refresh_src_scale_bits: 0,
             shape_last_extrect_by_scale: HashMap::new(),
             ignore_nested_blurs: false,
             preview_mode: false,
@@ -475,6 +567,40 @@ impl RenderState {
 
             self.shape_last_extrect_by_scale.insert(key, new_extrect);
         }
+
+        // Additionally invalidate the 100% zoom cache, but only for tiles that we already had.
+        // This is the fast_mode source cache; we want it refreshed after edits, without
+        // creating work for tiles that were never cached at 100%.
+        let base_bits = self.base_zoom_placeholder_scale_bits();
+        let base_scale = f32::from_bits(base_bits);
+        if base_scale.is_finite() && base_scale > 0.0 {
+            let new_extrect = shape.extrect(tree, base_scale);
+            let key = ShapeScaleKey {
+                shape_id: shape.id,
+                scale_bits: base_bits,
+            };
+            let rect = if let Some(old) = self.shape_last_extrect_by_scale.get(&key).copied() {
+                Self::rect_union(old, new_extrect)
+            } else {
+                new_extrect
+            };
+
+            let tile_size = tiles::get_tile_size(base_scale);
+            let TileRect(sx, sy, ex, ey) = tiles::get_tiles_for_rect(rect, tile_size);
+            for x in sx..=ex {
+                for y in sy..=ey {
+                    let tile = tiles::Tile::from(x, y);
+                    if self.surfaces.has_cached_tile_surface_stale_ok(tile, base_bits) {
+                        self.surfaces.remove_cached_tile_surface(tile, base_bits);
+                    }
+                }
+            }
+
+            self.shape_last_extrect_by_scale.insert(key, new_extrect);
+        }
+
+        // Any edit means the base cache may need refresh after next full render.
+        self.base_cache_refresh_pending = true;
     }
 
     /// Combines every visible layer blur currently active (ancestors + shape)
@@ -1639,18 +1765,25 @@ impl RenderState {
         timestamp: i32,
     ) -> Result<()> {
         performance::begin_measure!("process_animation_frame");
+        // Always advance the base-cache refresh job in small batches.
+        // This job may be scheduled at the end of a full-quality render, and must
+        // keep progressing even after the main render finishes (non-blocking).
+        self.process_base_cache_refresh_batch(4);
+
         if self.render_in_progress {
             if tree.len() != 0 {
                 self.render_shape_tree_partial(base_object, tree, timestamp, true)?;
             }
             self.flush_and_submit();
+        }
 
-            if self.render_in_progress {
-                self.cancel_animation_frame();
-                self.render_request_id = Some(wapi::request_animation_frame!());
-            } else {
-                performance::end_measure!("render");
-            }
+        // Keep the RAF loop alive while either rendering is in progress or the
+        // base-cache refresh job still has work to do.
+        if self.render_in_progress || !self.base_cache_refresh_queue.is_empty() {
+            self.cancel_animation_frame();
+            self.render_request_id = Some(wapi::request_animation_frame!());
+        } else if !self.render_in_progress {
+            performance::end_measure!("render");
         }
         performance::end_measure!("process_animation_frame");
         Ok(())
@@ -2762,6 +2895,14 @@ impl RenderState {
 
         // Mark cache as valid for render_from_cache
         self.cached_viewbox = self.viewbox;
+
+        // If there was an edit, once we finish a full-quality render at a zoom != 100%,
+        // schedule a non-blocking refresh of the 100% cache from those rendered tiles.
+        if self.base_cache_refresh_pending && !self.options.is_fast_mode() {
+            self.schedule_base_cache_refresh_from_full_render(self.get_scale().to_bits());
+        }
+        // Always process a small batch so refresh progresses without blocking.
+        self.process_base_cache_refresh_batch(4);
 
         if self.options.is_debug_visible() {
             debug::render(self);
