@@ -373,12 +373,12 @@ pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
 
 impl RenderState {
     fn schedule_base_cache_refresh_from_full_render(&mut self, src_scale_bits: u32) {
-        let base_bits = self.base_zoom_placeholder_scale_bits();
-        if src_scale_bits == base_bits {
+        let dst_bits = self.fast_anchor_scale_bits();
+        if src_scale_bits == dst_bits {
             self.base_cache_refresh_pending = false;
             self.base_cache_refresh_queue.clear();
             self.base_cache_refresh_src_scale_bits = 0;
-            println!("base-cache(100%) refresh skipped (already at 100%)");
+            println!("base-cache(anchor) refresh skipped (already at anchor)");
             return;
         }
         // Schedule only tiles we actually have at src scale (interest area).
@@ -435,18 +435,28 @@ impl RenderState {
             println!("base-cache(100%) refresh done (queue already empty)");
             return;
         }
-        let base_bits = self.base_zoom_placeholder_scale_bits();
+        let dst_bits = self.fast_anchor_scale_bits();
         let src_bits = self.base_cache_refresh_src_scale_bits;
+        let dst_scale = f32::from_bits(dst_bits);
+        if !dst_scale.is_finite() || dst_scale <= 0.0 {
+            return;
+        }
+        let dst_interest_rect = tiles::get_tiles_for_viewbox_with_interest(
+            self.viewbox,
+            VIEWPORT_INTEREST_AREA_THRESHOLD,
+            dst_scale,
+        );
         for _ in 0..max_tiles {
             let Some(tile) = self.base_cache_refresh_queue.pop() else { break };
             let Some(img) = self.surfaces.cached_tile_image(tile, src_bits) else { continue };
-            self.surfaces.reproject_cached_tile_into_scale(
+            self.surfaces.reproject_cached_tile_into_scale_limited(
                 &self.tile_viewbox,
                 &img,
                 tile,
                 src_bits,
-                base_bits,
+                dst_bits,
                 self.background_color,
+                &dst_interest_rect,
             );
         }
         if self.base_cache_refresh_queue.is_empty() {
@@ -514,16 +524,43 @@ impl RenderState {
         })
     }
 
-    /// Device scale when workspace zoom is 100% (`viewbox.zoom == 1`): `1.0 * dpr`.
-    fn base_zoom_placeholder_scale_bits(&self) -> u32 {
-        (1.0_f32 * self.options.dpr()).to_bits()
+    // Fast-zoom anchor levels (workspace zoom, without DPR).
+    // These are chosen to cap cross-zoom propagation work and avoid cache explosions
+    // when zooming very far out (e.g. < 10%).
+    const FAST_ZOOM_ANCHORS: [f32; 3] = [1.0, 0.25, 0.0625];
+
+    fn fast_anchor_zoom(&self, zoom: f32) -> f32 {
+        if zoom >= Self::FAST_ZOOM_ANCHORS[1] {
+            Self::FAST_ZOOM_ANCHORS[0] // 100%
+        } else if zoom >= Self::FAST_ZOOM_ANCHORS[2] {
+            Self::FAST_ZOOM_ANCHORS[1] // 25%
+        } else {
+            Self::FAST_ZOOM_ANCHORS[2] // 6.25%
+        }
+    }
+
+    /// Device scale bits (includes DPR) for the anchor cache used by fast-mode.
+    fn fast_anchor_scale_bits(&self) -> u32 {
+        (self.fast_anchor_zoom(self.viewbox.zoom()) * self.options.dpr()).to_bits()
+    }
+
+    fn scale_bits_for_zoom(&self, zoom: f32) -> u32 {
+        (zoom * self.options.dpr()).to_bits()
+    }
+
+    fn anchor_scale_bits_list(&self) -> [u32; 3] {
+        [
+            self.scale_bits_for_zoom(Self::FAST_ZOOM_ANCHORS[0]),
+            self.scale_bits_for_zoom(Self::FAST_ZOOM_ANCHORS[1]),
+            self.scale_bits_for_zoom(Self::FAST_ZOOM_ANCHORS[2]),
+        ]
     }
 
     /// Scale bits used to look up tile textures in the cache.
-    /// In `fast_mode`, always use the 100% zoom cache; otherwise use current scale.
+    /// In `fast_mode`, use an anchor cache (100%/25%/6.25%); otherwise use current scale.
     fn tile_texture_cache_lookup_scale_bits(&self) -> u32 {
         if self.options.is_fast_mode() {
-            self.base_zoom_placeholder_scale_bits()
+            self.fast_anchor_scale_bits()
         } else {
             self.get_scale().to_bits()
         }
@@ -568,16 +605,16 @@ impl RenderState {
             self.shape_last_extrect_by_scale.insert(key, new_extrect);
         }
 
-        // Additionally invalidate the 100% zoom cache, but only for tiles that we already had.
-        // This is the fast_mode source cache; we want it refreshed after edits, without
-        // creating work for tiles that were never cached at 100%.
-        let base_bits = self.base_zoom_placeholder_scale_bits();
-        let base_scale = f32::from_bits(base_bits);
-        if base_scale.is_finite() && base_scale > 0.0 {
-            let new_extrect = shape.extrect(tree, base_scale);
+        // Additionally invalidate the current fast-mode anchor cache (100% / 25% / 6.25%),
+        // but only for tiles that we already had. This keeps the interaction cache correct
+        // without creating new tiles at the anchor level.
+        let anchor_bits = self.fast_anchor_scale_bits();
+        let anchor_scale = f32::from_bits(anchor_bits);
+        if anchor_scale.is_finite() && anchor_scale > 0.0 {
+            let new_extrect = shape.extrect(tree, anchor_scale);
             let key = ShapeScaleKey {
                 shape_id: shape.id,
-                scale_bits: base_bits,
+                scale_bits: anchor_bits,
             };
             let rect = if let Some(old) = self.shape_last_extrect_by_scale.get(&key).copied() {
                 Self::rect_union(old, new_extrect)
@@ -585,13 +622,16 @@ impl RenderState {
                 new_extrect
             };
 
-            let tile_size = tiles::get_tile_size(base_scale);
+            let tile_size = tiles::get_tile_size(anchor_scale);
             let TileRect(sx, sy, ex, ey) = tiles::get_tiles_for_rect(rect, tile_size);
             for x in sx..=ex {
                 for y in sy..=ey {
                     let tile = tiles::Tile::from(x, y);
-                    if self.surfaces.has_cached_tile_surface_stale_ok(tile, base_bits) {
-                        self.surfaces.remove_cached_tile_surface(tile, base_bits);
+                    if self
+                        .surfaces
+                        .has_cached_tile_surface_stale_ok(tile, anchor_bits)
+                    {
+                        self.surfaces.remove_cached_tile_surface(tile, anchor_bits);
                     }
                 }
             }
@@ -867,21 +907,30 @@ impl RenderState {
             scale_bits,
         );
 
-        // Bootstrap / keep 100% cache warm: whenever we finish a full-quality tile render at
-        // a zoom != 100%, reproject that tile into the corresponding 100% tiles.
-        // This lets fast_mode rely on 100% even if the file opened at 60%, etc.
+        // Bootstrap / keep fast-mode anchor cache warm: whenever we finish a full-quality tile
+        // render, reproject that tile into the currently selected anchor (100% / 25% / 6.25%),
+        // limited to the anchor interest rect to avoid cache explosions at extreme zoom-outs.
         if !self.options.is_fast_mode() {
             if let Some(img) = rendered_tile_image.as_ref() {
-                let base_bits = self.base_zoom_placeholder_scale_bits();
-                if base_bits != scale_bits {
-                    self.surfaces.reproject_cached_tile_into_scale(
+                let anchor_bits = self.fast_anchor_scale_bits();
+                if anchor_bits != scale_bits {
+                    let anchor_scale = f32::from_bits(anchor_bits);
+                    if anchor_scale.is_finite() && anchor_scale > 0.0 {
+                        let anchor_interest_rect = tiles::get_tiles_for_viewbox_with_interest(
+                            self.viewbox,
+                            VIEWPORT_INTEREST_AREA_THRESHOLD,
+                            anchor_scale,
+                        );
+                        self.surfaces.reproject_cached_tile_into_scale_limited(
                         &self.tile_viewbox,
                         img,
                         tile,
                         scale_bits,
-                        base_bits,
+                        anchor_bits,
                         self.background_color,
+                        &anchor_interest_rect,
                     );
+                    }
                 }
             }
         }
@@ -1643,6 +1692,15 @@ impl RenderState {
                             );
                         } else {
                             let target_world_rect = tiles::get_tile_rect(tile, current_scale);
+                            let anchor_bits = self.fast_anchor_scale_bits();
+                            let forced_anchor = self
+                                .options
+                                .is_fast_mode()
+                                .then_some(anchor_bits)
+                                .filter(|bits| {
+                                    self.surfaces
+                                        .world_rect_has_any_tile_at_scale_bits(target_world_rect, *bits)
+                                });
                             let _ = self.surfaces.draw_tile_fallback_cross_zoom(
                                 &self.tile_viewbox,
                                 rect,
@@ -1650,9 +1708,7 @@ impl RenderState {
                                 target_world_rect,
                                 current_scale,
                                 current_scale_bits,
-                                self.options
-                                    .is_fast_mode()
-                                    .then_some(self.base_zoom_placeholder_scale_bits()),
+                                forced_anchor,
                                 true,
                             );
                         }
@@ -1710,6 +1766,8 @@ impl RenderState {
         let scale = self.get_scale();
 
         self.tile_viewbox.update(self.viewbox, scale);
+        self.surfaces
+            .set_protected_tile_cache_scales(self.anchor_scale_bits_list());
         self.focus_mode.reset();
 
         performance::begin_measure!("render");
@@ -2814,6 +2872,13 @@ impl RenderState {
                     // never show empty tiles while the exact tile is being regenerated.
                     let tile_rect = self.get_current_tile_bounds()?;
                     let target_world_rect = tiles::get_tile_rect(current_tile, scale);
+                    let anchor_bits = self.fast_anchor_scale_bits();
+                    let forced_anchor = fast_mode
+                        .then_some(anchor_bits)
+                        .filter(|bits| {
+                            self.surfaces
+                                .world_rect_has_any_tile_at_scale_bits(target_world_rect, *bits)
+                        });
                     let _blits = self.surfaces.draw_tile_fallback_cross_zoom(
                         &self.tile_viewbox,
                         tile_rect,
@@ -2821,7 +2886,7 @@ impl RenderState {
                         target_world_rect,
                         scale,
                         lookup_bits,
-                        fast_mode.then_some(self.base_zoom_placeholder_scale_bits()),
+                        forced_anchor,
                         true,
                     );
                     performance::begin_measure!("render_shape_tree::uncached");

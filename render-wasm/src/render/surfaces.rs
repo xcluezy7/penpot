@@ -4,7 +4,7 @@ use crate::shapes::Shape;
 
 use skia_safe::{self as skia, IRect, Paint, RRect, Rect};
 
-use super::{gpu_state::GpuState, tiles::Tile, tiles::TileViewbox, tiles::TILE_SIZE};
+use super::{gpu_state::GpuState, tiles::Tile, tiles::TileRect, tiles::TileViewbox, tiles::TILE_SIZE};
 
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::{HashMap, HashSet};
@@ -701,6 +701,90 @@ impl Surfaces {
         }
     }
 
+    /// Like `reproject_cached_tile_into_scale` but only writes destination tiles that are within
+    /// `dst_tile_limit` (typically the destination interest rect for the current viewport).
+    pub fn reproject_cached_tile_into_scale_limited(
+        &mut self,
+        tile_viewbox: &TileViewbox,
+        src_image: &skia::Image,
+        src_tile: Tile,
+        src_scale_bits: u32,
+        dst_scale_bits: u32,
+        background: skia::Color,
+        dst_tile_limit: &TileRect,
+    ) {
+        let src_scale = f32::from_bits(src_scale_bits);
+        let dst_scale = f32::from_bits(dst_scale_bits);
+        if !src_scale.is_finite()
+            || src_scale <= 0.0
+            || !dst_scale.is_finite()
+            || dst_scale <= 0.0
+        {
+            return;
+        }
+
+        let src_world_rect = super::tiles::get_tile_rect(src_tile, src_scale);
+        let dst_tile_size_world = super::tiles::get_tile_size(dst_scale);
+        let super::tiles::TileRect(sx, sy, ex, ey) =
+            super::tiles::get_tiles_for_rect(src_world_rect, dst_tile_size_world);
+
+        for x in sx..=ex {
+            for y in sy..=ey {
+                let dst_tile = Tile::from(x, y);
+                if !dst_tile_limit.contains(&dst_tile) {
+                    continue;
+                }
+
+                let dst_world_rect = super::tiles::get_tile_rect(dst_tile, dst_scale);
+                let Some(overlap_world) =
+                    Self::rect_intersection(src_world_rect, dst_world_rect)
+                else {
+                    continue;
+                };
+
+                let src_px_l = (overlap_world.left() - src_world_rect.left()) * src_scale;
+                let src_px_t = (overlap_world.top() - src_world_rect.top()) * src_scale;
+                let src_px_r = (overlap_world.right() - src_world_rect.left()) * src_scale;
+                let src_px_b = (overlap_world.bottom() - src_world_rect.top()) * src_scale;
+                let src_rect = Rect::from_ltrb(src_px_l, src_px_t, src_px_r, src_px_b);
+
+                let dst_px_l = (overlap_world.left() - dst_world_rect.left()) * dst_scale;
+                let dst_px_t = (overlap_world.top() - dst_world_rect.top()) * dst_scale;
+                let dst_px_r = (overlap_world.right() - dst_world_rect.left()) * dst_scale;
+                let dst_px_b = (overlap_world.bottom() - dst_world_rect.top()) * dst_scale;
+                let dst_rect = Rect::from_ltrb(dst_px_l, dst_px_t, dst_px_r, dst_px_b);
+
+                let mut tile_surface = match self
+                    .current
+                    .new_surface_with_dimensions((TILE_SIZE as i32, TILE_SIZE as i32))
+                {
+                    Some(s) => s,
+                    None => return,
+                };
+
+                tile_surface.canvas().clear(background);
+                if let Some(existing) = self.tiles.get_stale(dst_tile, dst_scale_bits) {
+                    tile_surface.canvas().draw_image_rect(
+                        existing,
+                        None,
+                        Rect::from_xywh(0.0, 0.0, TILE_SIZE, TILE_SIZE),
+                        &skia::Paint::default(),
+                    );
+                }
+
+                tile_surface.canvas().draw_image_rect(
+                    src_image,
+                    Some((&src_rect, skia::canvas::SrcRectConstraint::Fast)),
+                    dst_rect,
+                    &skia::Paint::default(),
+                );
+
+                let new_img = tile_surface.image_snapshot();
+                self.tiles.add(tile_viewbox, &dst_tile, dst_scale_bits, new_img);
+            }
+        }
+    }
+
     /// Draws the current tile directly to the target and cache surfaces without
     /// creating a snapshot. This avoids GPU stalls from ReadPixels but doesn't
     /// populate the tile texture cache (suitable for one-shot renders like tests).
@@ -875,6 +959,10 @@ impl Surfaces {
         self.tiles.gc();
     }
 
+    pub fn set_protected_tile_cache_scales(&mut self, scale_bits: [u32; 3]) {
+        self.tiles.set_protected_scales(scale_bits);
+    }
+
     pub fn resize_export_surface(&mut self, scale: f32, rect: skia::Rect) {
         let target_w = (scale * rect.width()).ceil() as i32;
         let target_h = (scale * rect.height()).ceil() as i32;
@@ -921,6 +1009,7 @@ pub struct TileTextureCache {
     grid: HashMap<TileCacheKey, skia::Image>,
     removed: HashSet<TileCacheKey>,
     scales: HashSet<u32>,
+    protected_scales: HashSet<u32>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
@@ -935,7 +1024,13 @@ impl TileTextureCache {
             grid: HashMap::default(),
             removed: HashSet::default(),
             scales: HashSet::default(),
+            protected_scales: HashSet::default(),
         }
+    }
+
+    pub fn set_protected_scales(&mut self, scales: impl IntoIterator<Item = u32>) {
+        self.protected_scales.clear();
+        self.protected_scales.extend(scales);
     }
 
     pub fn has(&self, tile: Tile, scale_bits: u32) -> bool {
@@ -959,20 +1054,50 @@ impl TileTextureCache {
     }
 
     fn free_tiles(&mut self, tile_viewbox: &TileViewbox) {
-        println!("free_tiles");
-        let marked: Vec<_> = self
-            .grid
-            .iter_mut()
-            .filter_map(|(key, _)| {
+        // Trace cache distribution by scale when evicting tiles.
+        // Helpful to diagnose cache explosions at extreme zoom levels.
+        let mut counts_by_scale: HashMap<u32, usize> = HashMap::new();
+        for key in self.grid.keys() {
+            *counts_by_scale.entry(key.scale_bits).or_insert(0) += 1;
+        }
+        // Ensure protected scales show up in the trace even if currently empty.
+        for bits in self.protected_scales.iter().copied() {
+            counts_by_scale.entry(bits).or_insert(0);
+        }
+
+        let mut scales: Vec<u32> = counts_by_scale.keys().copied().collect();
+        scales.sort_unstable();
+        println!(
+            "free_tiles: total_tiles={} scales={} dist={}",
+            self.grid.len(),
+            scales.len(),
+            scales
+                .iter()
+                .map(|bits| format!("{:.4}:{:?}", f32::from_bits(*bits), counts_by_scale[bits]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // Prefer evicting non-protected (non-anchor) tiles first.
+        let mut marked: Vec<TileCacheKey> = Vec::new();
+        for pass in [false, true] {
+            if marked.len() >= TEXTURES_BATCH_DELETE {
+                break;
+            }
+            for (key, _) in self.grid.iter() {
+                if marked.len() >= TEXTURES_BATCH_DELETE {
+                    break;
+                }
+                // First pass: only non-protected scales. Second pass: allow protected.
+                if !pass && self.protected_scales.contains(&key.scale_bits) {
+                    continue;
+                }
                 // Approximate visibility check: uses tile coords only.
                 if !tile_viewbox.is_visible(&key.tile) {
-                    Some(*key)
-                } else {
-                    None
+                    marked.push(*key);
                 }
-            })
-            .take(TEXTURES_BATCH_DELETE)
-            .collect();
+            }
+        }
 
         for key in marked.iter() {
             self.grid.remove(key);
