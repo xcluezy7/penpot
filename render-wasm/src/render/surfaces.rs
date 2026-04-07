@@ -1068,40 +1068,121 @@ impl TileTextureCache {
         let mut scales: Vec<u32> = counts_by_scale.keys().copied().collect();
         scales.sort_unstable();
         println!(
-            "free_tiles: total_tiles={} scales={} dist={}",
+            "free_tiles: total_tiles={} scales={} protected=[{}] dist={}",
             self.grid.len(),
             scales.len(),
+            {
+                let mut protected: Vec<u32> = self.protected_scales.iter().copied().collect();
+                protected.sort_unstable();
+                protected
+                    .iter()
+                    .map(|bits| format!("{:.4}", f32::from_bits(*bits)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
             scales
                 .iter()
-                .map(|bits| format!("{:.4}:{:?}", f32::from_bits(*bits), counts_by_scale[bits]))
+                .map(|bits| {
+                    let mark = if self.protected_scales.contains(bits) {
+                        "*"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}{:.4}:{:?}",
+                        mark,
+                        f32::from_bits(*bits),
+                        counts_by_scale[bits]
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         );
 
-        // Prefer evicting non-protected (non-anchor) tiles first.
-        let mut marked: Vec<TileCacheKey> = Vec::new();
-        for pass in [false, true] {
-            if marked.len() >= TEXTURES_BATCH_DELETE {
-                break;
+        // Eviction strategy: if we decide to evict a zoom level (`scale_bits`),
+        // purge it entirely. This avoids keeping fragmented partial levels around,
+        // which often hurts reuse and makes cache behavior harder to reason about.
+        //
+        // We choose the best candidate level by minimizing the fraction of visible
+        // tiles at that scale (approx visibility check: tile coords only).
+        #[derive(Clone, Copy)]
+        struct ScaleStats {
+            total: usize,
+            visible: usize,
+            protected: bool,
+        }
+
+        let mut stats: HashMap<u32, ScaleStats> = HashMap::new();
+        for (key, _) in self.grid.iter() {
+            let entry = stats.entry(key.scale_bits).or_insert(ScaleStats {
+                total: 0,
+                visible: 0,
+                protected: self.protected_scales.contains(&key.scale_bits),
+            });
+            entry.total += 1;
+            if tile_viewbox.is_visible(&key.tile) {
+                entry.visible += 1;
             }
-            for (key, _) in self.grid.iter() {
-                if marked.len() >= TEXTURES_BATCH_DELETE {
-                    break;
-                }
-                // First pass: only non-protected scales. Second pass: allow protected.
-                if !pass && self.protected_scales.contains(&key.scale_bits) {
-                    continue;
-                }
-                // Approximate visibility check: uses tile coords only.
-                if !tile_viewbox.is_visible(&key.tile) {
-                    marked.push(*key);
+        }
+        // Ensure protected empty levels are represented so selection logic
+        // never accidentally assumes "no protected levels exist".
+        for bits in self.protected_scales.iter().copied() {
+            stats.entry(bits).or_insert(ScaleStats {
+                total: 0,
+                visible: 0,
+                protected: true,
+            });
+        }
+
+        let mut best: Option<(u32, ScaleStats)> = None;
+        for (bits, s) in stats.iter().map(|(b, s)| (*b, *s)) {
+            if s.total == 0 {
+                continue;
+            }
+            match best {
+                None => best = Some((bits, s)),
+                Some((_, cur)) => {
+                    // Prefer non-protected scales.
+                    if cur.protected && !s.protected {
+                        best = Some((bits, s));
+                        continue;
+                    }
+                    if cur.protected != s.protected {
+                        continue;
+                    }
+                    // Prefer the scale with fewer visible tiles; if equal, purge the larger level.
+                    if s.visible < cur.visible || (s.visible == cur.visible && s.total > cur.total) {
+                        best = Some((bits, s));
+                    }
                 }
             }
         }
 
-        for key in marked.iter() {
+        let Some((purge_bits, purge_stats)) = best else {
+            return;
+        };
+
+        let mut to_remove: Vec<TileCacheKey> = Vec::with_capacity(purge_stats.total);
+        for key in self.grid.keys() {
+            if key.scale_bits == purge_bits {
+                to_remove.push(*key);
+            }
+        }
+        for key in to_remove.iter() {
             self.grid.remove(key);
         }
+        // Keep tombstones consistent: if a scale is fully purged, drop any removed keys
+        // for that same scale to avoid unbounded growth.
+        self.removed.retain(|k| k.scale_bits != purge_bits);
+        self.scales.remove(&purge_bits);
+
+        println!(
+            "free_tiles: purged_scale={:.4} protected={} removed={} (visible={})",
+            f32::from_bits(purge_bits),
+            purge_stats.protected,
+            to_remove.len(),
+            purge_stats.visible
+        );
     }
 
     pub fn add(
