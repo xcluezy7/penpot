@@ -337,6 +337,9 @@ pub(crate) struct RenderState {
     /// Preview render mode - when true, uses simplified rendering for progressive loading
     pub preview_mode: bool,
     pub export_context: Option<(Rect, f32)>,
+    /// Cleared at the beginning of a render pass; set to true after we clear Cache the first
+    /// time we are about to blit a tile into Cache for this pass.
+    pub cache_cleared_this_render: bool,
 }
 
 pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
@@ -411,6 +414,7 @@ impl RenderState {
             ignore_nested_blurs: false,
             preview_mode: false,
             export_context: None,
+            cache_cleared_this_render: false,
         })
     }
 
@@ -665,13 +669,22 @@ impl RenderState {
     }
 
     pub fn apply_render_to_final_canvas(&mut self, rect: skia::Rect) -> Result<()> {
+        // Decide *now* (at the first real cache blit) whether we need to clear Cache.
+        // This avoids clearing Cache on renders that don't actually paint tiles (e.g. hover/UI),
+        // while still preventing stale pixels from surviving across full-quality renders.
+        if !self.options.is_fast_mode() && !self.cache_cleared_this_render {
+            self.surfaces.clear_cache(self.background_color);
+            self.cache_cleared_this_render = true;
+        }
         let tile_rect = self.get_current_aligned_tile_bounds()?;
         self.surfaces.cache_current_tile_texture(
+            &mut self.gpu_state,
             &self.tile_viewbox,
             &self
                 .current_tile
                 .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
             &tile_rect,
+            self.render_area,
         );
 
         self.surfaces.draw_cached_tile_surface(
@@ -1410,8 +1423,15 @@ impl RenderState {
         performance::begin_measure!("render_from_cache");
         let scale = self.get_cached_scale();
 
+        println!("render_from_cache");
         // Check if we have a valid cached viewbox (non-zero dimensions indicate valid cache)
         if self.cached_viewbox.area.width() > 0.0 {
+            // For zoom-in, the best fast-path is to reproject the cached frame
+            // (viewport-sized) with a matrix. This avoids depending on atlas
+            // resolution (which may be downscaled for huge documents) and avoids
+            // any tile/atlas composition.
+            let zooming_in = self.viewbox.zoom > self.cached_viewbox.zoom;
+
             // Scale and translate the target according to the cached data
             let navigate_zoom = self.viewbox.zoom / self.cached_viewbox.zoom;
 
@@ -1427,6 +1447,61 @@ impl RenderState {
             let translate_y = (start_tile_y as f32 * tiles::TILE_SIZE) - offset_y;
             let bg_color = self.background_color;
 
+            // For zoom-out, prefer cache only if it fully covers the viewport.
+            // Otherwise, atlas will provide a more correct full-viewport preview.
+            let zooming_out = self.viewbox.zoom < self.cached_viewbox.zoom;
+            if zooming_out {
+                let cache_dim = self.surfaces.cache_dimensions();
+                let cache_w = cache_dim.width as f32;
+                let cache_h = cache_dim.height as f32;
+
+                // Viewport in target pixels.
+                let vw = (self.viewbox.width * self.options.dpr()).max(1.0);
+                let vh = (self.viewbox.height * self.options.dpr()).max(1.0);
+
+                // Inverse-map viewport corners into cache coordinates.
+                // target = (cache * navigate_zoom) translated by (translate_x, translate_y) (in cache coords).
+                // => cache = (target / navigate_zoom) - translate
+                let inv = if navigate_zoom.abs() > f32::EPSILON {
+                    1.0 / navigate_zoom
+                } else {
+                    0.0
+                };
+
+                let cx0 = (0.0 * inv) - translate_x;
+                let cy0 = (0.0 * inv) - translate_y;
+                let cx1 = (vw * inv) - translate_x;
+                let cy1 = (vh * inv) - translate_y;
+
+                let min_x = cx0.min(cx1);
+                let min_y = cy0.min(cy1);
+                let max_x = cx0.max(cx1);
+                let max_y = cy0.max(cy1);
+
+                let cache_covers = min_x >= 0.0 && min_y >= 0.0 && max_x <= cache_w && max_y <= cache_h;
+                println!("cache_covers: {}", cache_covers);
+                if !cache_covers {
+                    // Early return only if atlas exists; otherwise keep cache path.
+                    if self.surfaces.has_atlas() {
+                        self.surfaces.draw_atlas_to_target(
+                            self.viewbox,
+                            self.options.dpr(),
+                            self.background_color,
+                        );
+
+                        if self.options.is_debug_visible() {
+                            debug::render(self);
+                        }
+
+                        ui::render(self, shapes);
+                        debug::render_wasm_label(self);
+                        self.flush_and_submit();
+                        println!("atlas drawn");
+                        return;
+                    }
+                }
+            }
+
             // Setup canvas transform
             {
                 let canvas = self.surfaces.canvas(SurfaceId::Target);
@@ -1437,6 +1512,7 @@ impl RenderState {
             }
 
             // Draw directly from cache surface, avoiding snapshot overhead
+            println!("drawn from cache");
             self.surfaces.draw_cache_to_target();
 
             // Restore canvas state
@@ -1451,6 +1527,7 @@ impl RenderState {
 
             self.flush_and_submit();
         }
+
         performance::end_measure!("render_from_cache");
         performance::end_timed_log!("render_from_cache", _start);
     }
@@ -1497,6 +1574,7 @@ impl RenderState {
         performance::begin_measure!("render");
         performance::begin_measure!("start_render_loop");
 
+        self.cache_cleared_this_render = false;
         self.reset_canvas();
         let surface_ids = SurfaceId::Strokes as u32
             | SurfaceId::Fills as u32
