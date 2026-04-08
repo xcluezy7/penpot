@@ -54,7 +54,8 @@
    [app.util.object :as obj]
    [app.util.theme :as theme]
    [beicon.v2.core :as rx]
-   [cuerdas.core :as str]))
+   [cuerdas.core :as str]
+   [potok.v2.core :as ptk]))
 
 ;;
 ;; PLUGINS PUBLIC API - The plugins will able to access this functions
@@ -653,4 +654,25 @@
                          {:trigger "plugin:combine-as-variants" :variant-id variant-id}))
               (shape/shape-proxy plugin-id variant-id))
 
-            (u/not-valid plugin-id :shapes "One of the components is not on the same page or is already a variant")))))))
+            (u/not-valid plugin-id :shapes "One of the components is not on the same page or is already a variant")))))
+
+    :waitForLayoutUpdate
+    (fn [timeout]
+      (js/Promise.
+       (fn [resolve reject]
+         (->> (rx/combine-latest-all
+               [(if timeout
+                  (->> (rx/of :timeout)
+                       (rx/delay timeout))
+                  (rx/empty))
+
+                ;; TODO: Wait for the layout to update
+              ])
+              (rx/take 1)
+              (rx/subs!
+               (fn [value]
+                 (if (= value :timeout)
+                   ;; If timeout we reject
+                   (reject)
+                   (resolve)))
+               reject)))))))
