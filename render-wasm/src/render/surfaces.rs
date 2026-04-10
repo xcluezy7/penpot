@@ -581,16 +581,34 @@ impl Surfaces {
         self.tiles.remove(tile);
     }
 
-    pub fn draw_cached_tile_surface(&mut self, tile: Tile, rect: skia::Rect, color: skia::Color) {
+    /// Draws a cached tile image to the target. When `cache_rect` is set, also blits into the
+    /// cache mosaic (`render_from_cache`).
+    pub fn draw_cached_tile_surface(
+        &mut self,
+        tile: Tile,
+        target_rect: skia::Rect,
+        cache_rect: Option<skia::Rect>,
+        color: skia::Color,
+    ) {
         if let Some(image) = self.tiles.get(tile) {
+            let img: &skia::Image = &*image;
             let mut paint = skia::Paint::default();
             paint.set_color(color);
 
-            self.target.canvas().draw_rect(rect, &paint);
+            self.target.canvas().draw_rect(target_rect, &paint);
 
-            self.target
-                .canvas()
-                .draw_image_rect(&image, None, rect, &skia::Paint::default());
+            self.target.canvas().draw_image_rect(
+                img,
+                None,
+                target_rect,
+                &skia::Paint::default(),
+            );
+
+            if let Some(cr) = cache_rect {
+                self.cache
+                    .canvas()
+                    .draw_image_rect(img, None, cr, &skia::Paint::default());
+            }
         }
     }
 
@@ -726,11 +744,7 @@ impl TileTextureCache {
             .grid
             .iter_mut()
             .filter_map(|(tile, _)| {
-                if !tile_viewbox.is_visible(tile) {
-                    Some(*tile)
-                } else {
-                    None
-                }
+                (!tile_viewbox.is_visible(tile)).then_some(*tile)
             })
             .take(TEXTURES_BATCH_DELETE)
             .collect();

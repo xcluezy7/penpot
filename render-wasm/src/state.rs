@@ -112,14 +112,16 @@ impl State {
     }
 
     pub fn start_render_loop(&mut self, timestamp: i32) -> Result<()> {
-        // If zoom changed (e.g. interrupted zoom render followed by pan), the
-        // tile index may be stale for the new viewport position. Rebuild the
-        // index so shapes are mapped to the correct tiles. We use
-        // rebuild_tile_index (NOT rebuild_tiles_shallow) to preserve the tile
-        // texture cache — otherwise cached tiles with shadows/blur would be
-        // cleared and re-rendered in fast mode without effects.
+        // During view interactions (wheel/pinch), the frontend paints intermediate frames via
+        // `render_from_cache` and may interrupt renders. If the zoom changes mid-flight, the
+        // tile index can become stale for the new viewbox and cached tile textures (rasterized
+        // at the previous scale) must not be blitted again.
+        //
+        // We therefore use `rebuild_tiles_shallow` on zoom changes: it rebuilds the tile index
+        // and drops cached tiles for zoom transitions, but keeps the cache intact for same-zoom
+        // pans (so panning stays fast).
         if self.render_state.zoom_changed() {
-            self.render_state.rebuild_tile_index(&self.shapes);
+            self.render_state.rebuild_tiles_shallow(&self.shapes);
         }
 
         self.render_state

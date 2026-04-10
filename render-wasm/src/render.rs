@@ -361,6 +361,23 @@ pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
         .into()
 }
 
+/// Origin (px) of the tile-aligned grid used when blitting into `SurfaceId::Cache`.
+///
+/// The cache mosaic stores tiles on a fixed \(TILE_SIZE × TILE_SIZE\) grid in *scaled* pixel
+/// space (i.e. after applying `scale`). When the viewbox is between tile boundaries (pan),
+/// the on-screen tile bounds (`get_current_tile_bounds`) move continuously, but the cache mosaic
+/// must remain snapped to the global grid so previously cached tiles keep landing in the same
+/// slots.
+///
+/// This function computes that snapped grid origin by rounding the viewbox top-left down to the
+/// nearest multiple of `tiles::TILE_SIZE` in scaled space. Callers then position individual tiles
+/// relative to this origin via `get_aligned_tile_bounds`.
+fn cache_mosaic_snap_origin(viewbox: Viewbox, scale: f32) -> (f32, f32) {
+    let sx = (viewbox.area.left * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+    let sy = (viewbox.area.top * scale / tiles::TILE_SIZE).floor() * tiles::TILE_SIZE;
+    (sx, sy)
+}
+
 impl RenderState {
     pub fn try_new(width: i32, height: i32) -> Result<RenderState> {
         // This needs to be done once per WebGL context.
@@ -676,19 +693,23 @@ impl RenderState {
             self.surfaces.clear_cache(self.background_color);
             self.cache_cleared_this_render = true;
         }
-        let tile_rect = self.get_current_aligned_tile_bounds()?;
+        // Cache mosaic uses a tile grid snapped to TILE_SIZE in scaled space; `render_from_cache`
+        // relies on that (continuous view offset minus snapped tile origin). The target blit must
+        // still use `rect` from `get_current_tile_bounds` for smooth sub-tile pan on screen.
+        let cache_tile_rect = self.get_current_aligned_tile_bounds()?;
         self.surfaces.cache_current_tile_texture(
             &self.tile_viewbox,
             &self
                 .current_tile
                 .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
-            &tile_rect,
+            &cache_tile_rect,
         );
 
         self.surfaces.draw_cached_tile_surface(
             self.current_tile
                 .ok_or(Error::CriticalError("Current tile not found".to_string()))?,
             rect,
+            None,
             self.background_color,
         );
         Ok(())
@@ -1510,6 +1531,7 @@ impl RenderState {
 
         self.cache_cleared_this_render = false;
         self.reset_canvas();
+
         let surface_ids = SurfaceId::Strokes as u32
             | SurfaceId::Fills as u32
             | SurfaceId::InnerShadows as u32
@@ -1519,7 +1541,8 @@ impl RenderState {
         });
 
         let viewbox_cache_size = get_cache_size(self.viewbox, scale);
-        let cached_viewbox_cache_size = get_cache_size(self.cached_viewbox, scale);
+        let cached_scale = self.get_cached_scale();
+        let cached_viewbox_cache_size = get_cache_size(self.cached_viewbox, cached_scale);
         // Only resize cache if the new size is larger than the cached size
         // This avoids unnecessary surface recreations when the cache size decreases
         if viewbox_cache_size.width > cached_viewbox_cache_size.width
@@ -1527,6 +1550,26 @@ impl RenderState {
         {
             self.surfaces
                 .resize_cache(viewbox_cache_size, VIEWPORT_INTEREST_AREA_THRESHOLD)?;
+        }
+
+        // The cache mosaic uses `get_aligned_tile_bounds` (snapped origin). If we pan across a
+        // TILE_SIZE boundary in scaled space, new tiles would map to different slots while old
+        // pixels stay put — `render_from_cache` then shows a sheared / shifted composite.
+        if self.cached_viewbox.area.width() > 0.0 {
+            println!("1");
+            let mosaic_stale = if self.zoom_changed() {
+                true
+            } else {
+                let snap_now = cache_mosaic_snap_origin(self.viewbox, scale);
+                let snap_cached = cache_mosaic_snap_origin(self.cached_viewbox, cached_scale);
+                snap_now != snap_cached
+            };
+            println!("mosaic_stale: {}", mosaic_stale);
+            if mosaic_stale {
+                println!("clearing cache");
+                self.surfaces.clear_cache(self.background_color);
+                self.cache_cleared_this_render = true;
+            }
         }
 
         // FIXME - review debug
@@ -1879,14 +1922,12 @@ impl RenderState {
         )
     }
 
-    // Returns the bounds of the current tile relative to the viewbox,
-    // aligned to the nearest tile grid origin.
-    //
-    // Unlike `get_current_tile_bounds`, which calculates bounds using the exact
-    // scaled offset of the viewbox, this method snaps the origin to the nearest
-    // lower multiple of `TILE_SIZE`. This ensures the tile bounds are aligned
-    // with the global tile grid, which is useful for rendering tiles in a
-    /// consistent and predictable layout.
+    /// Returns the bounds of the current tile relative to the viewbox, aligned to the nearest
+    /// tile grid origin.
+    ///
+    /// Unlike [`Self::get_current_tile_bounds`], which uses the exact scaled offset of the
+    /// viewbox, this snaps the origin to the nearest lower multiple of [`tiles::TILE_SIZE`], so
+    /// tile bounds line up with the global tile grid used for the cache mosaic.
     pub fn get_current_aligned_tile_bounds(&mut self) -> Result<Rect> {
         Ok(self.get_aligned_tile_bounds(
             self.current_tile
@@ -2571,9 +2612,15 @@ impl RenderState {
                 if self.surfaces.has_cached_tile_surface(current_tile) {
                     performance::begin_measure!("render_shape_tree::cached");
                     let tile_rect = self.get_current_tile_bounds()?;
+                    let cache_rect = if self.zoom_changed() {
+                        None
+                    } else {
+                        Some(self.get_aligned_tile_bounds(current_tile))
+                    };
                     self.surfaces.draw_cached_tile_surface(
                         current_tile,
                         tile_rect,
+                        cache_rect,
                         self.background_color,
                     );
                     performance::end_measure!("render_shape_tree::cached");
@@ -2866,13 +2913,10 @@ impl RenderState {
 
         self.rebuild_tile_index(tree);
 
-        // Zoom changes world tile size: a partial cache update would mix scales in the
-        // mosaic and glitch. Same zoom as last finished render (typical pan): drop only
-        // tile textures and keep the cache canvas for render_from_cache.
+        // Typical pan at the same zoom: keep tile textures so we can blit from cache.
+        // Zoom changes invalidate tile textures (different scale); drop caches then.
         if self.zoom_changed() {
             self.surfaces.remove_cached_tiles(self.background_color);
-        } else {
-            self.surfaces.invalidate_tile_cache();
         }
 
         performance::end_measure!("rebuild_tiles_shallow");
