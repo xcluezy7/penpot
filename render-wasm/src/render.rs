@@ -15,7 +15,7 @@ mod ui;
 
 use skia_safe::{self as skia, Matrix, RRect, Rect};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use gpu_state::GpuState;
 
@@ -36,6 +36,69 @@ use crate::wapi;
 
 pub use fonts::*;
 pub use images::*;
+
+#[derive(Clone)]
+struct CachedThumbnail {
+    image: skia::Image,
+    /// Document-space rectangle that the thumbnail should be drawn into.
+    doc_rect: Rect,
+    /// Scale of the view at capture time (best-effort heuristic/debug).
+    capture_scale: f32,
+}
+
+struct ThumbnailCache {
+    max_entries: usize,
+    // LRU bookkeeping: newest at the back
+    lru: VecDeque<Uuid>,
+    map: HashMap<Uuid, CachedThumbnail>,
+}
+
+impl ThumbnailCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            lru: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, id: &Uuid) -> Option<&CachedThumbnail> {
+        if self.map.contains_key(id) {
+            if let Some(pos) = self.lru.iter().position(|x| x == id) {
+                self.lru.remove(pos);
+            }
+            self.lru.push_back(*id);
+        }
+        self.map.get(id)
+    }
+
+    fn insert(&mut self, id: Uuid, value: CachedThumbnail) {
+        if self.map.contains_key(&id) {
+            self.map.insert(id, value);
+            if let Some(pos) = self.lru.iter().position(|x| x == &id) {
+                self.lru.remove(pos);
+            }
+            self.lru.push_back(id);
+            return;
+        }
+
+        self.map.insert(id, value);
+        self.lru.push_back(id);
+
+        while self.map.len() > self.max_entries {
+            if let Some(evicted) = self.lru.pop_front() {
+                self.map.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
 
 // This is the extra area used for tile rendering (tiles beyond viewport).
 // Higher values pre-render more tiles, reducing empty squares during pan but using more memory.
@@ -341,6 +404,12 @@ pub(crate) struct RenderState {
     /// Cleared at the beginning of a render pass; set to true after we clear Cache the first
     /// time we are about to blit a tile into Cache for this pass.
     pub cache_cleared_this_render: bool,
+
+    /// Best-effort in-memory thumbnails for top-level containers.
+    /// Phase 1: no invalidation; populated lazily when a thumbnail was requested.
+    thumbnails: ThumbnailCache,
+    /// Eligible container ids for which we want to capture a thumbnail when they finish rendering.
+    requested_thumbnails: HashSet<Uuid>,
 }
 
 pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
@@ -414,7 +483,96 @@ impl RenderState {
             preview_mode: false,
             export_context: None,
             cache_cleared_this_render: false,
+            thumbnails: ThumbnailCache::new(256),
+            requested_thumbnails: HashSet::default(),
         })
+    }
+
+    #[inline]
+    fn thumb_lod_mode(&self, scale: f32) -> bool {
+        true
+        // Phase 1 heuristic:
+        // - Always allow thumbnails in fast mode (pan/zoom in progress).
+        // - Also allow at very low zoom to reduce work.
+        // const THUMB_ZOOM_THRESHOLD: f32 = 0.22;
+        // self.options.is_fast_mode() || scale <= THUMB_ZOOM_THRESHOLD
+    }
+
+    #[inline]
+    fn thumb_is_eligible(shape: &Shape) -> bool {
+        // Phase 1 heuristic: top-level containers only.
+        // This covers root frames and (best-effort) top-level groups.
+        if shape.parent_id != Some(Uuid::nil()) {
+            return false;
+        }
+        matches!(shape.shape_type, Type::Frame(_) | Type::Group(_))
+    }
+
+    fn doc_rect_to_surface_irect(&mut self, doc_rect: Rect, scale: f32) -> skia::IRect {
+        let (tx, ty) = self
+            .surfaces
+            .get_render_context_translation(self.render_area, scale);
+
+        let left = ((doc_rect.left() + tx) * scale).floor() as i32;
+        let top = ((doc_rect.top() + ty) * scale).floor() as i32;
+        let right = ((doc_rect.right() + tx) * scale).ceil() as i32;
+        let bottom = ((doc_rect.bottom() + ty) * scale).ceil() as i32;
+
+        skia::IRect::new(left, top, right, bottom)
+    }
+
+    fn maybe_draw_thumbnail(&mut self, element: &Shape, tree: ShapesPoolRef, scale: f32) -> bool {
+        if !Self::thumb_is_eligible(element) || !self.thumb_lod_mode(scale) {
+            return false;
+        }
+
+        if let Some(cached) = self.thumbnails.get(&element.id) {
+            // Draw into fills; other passes stay empty. The fills surface is already
+            // transformed to document coordinates (scale+translate).
+            let canvas = self.surfaces.canvas_and_mark_dirty(SurfaceId::Fills);
+            canvas.draw_image_rect_with_sampling_options(
+                &cached.image,
+                None,
+                cached.doc_rect,
+                self.sampling_options,
+                &skia::Paint::default(),
+            );
+            // Composite the fills surface into the render surface so the thumbnail
+            // becomes visible immediately (matching the normal enter/exit path).
+            self.apply_drawing_to_render_canvas(Some(element), SurfaceId::Current);
+            return true;
+        }
+
+        // No cached thumbnail yet: request one and continue with normal rendering.
+        // We'll capture it when the container finishes a full render (visited_children exit).
+        let _ = tree; // reserved for phase 2 selection/invalidation
+        self.requested_thumbnails.insert(element.id);
+        false
+    }
+
+    fn maybe_capture_thumbnail(&mut self, element: &Shape, tree: ShapesPoolRef, scale: f32) {
+        if !self.requested_thumbnails.remove(&element.id) {
+            return;
+        }
+        if !Self::thumb_is_eligible(element) {
+            return;
+        }
+
+        // Capture the container's extrect in device pixels from the Current surface.
+        let doc_rect = element.extrect(tree, scale);
+        let irect = self.doc_rect_to_surface_irect(doc_rect, scale);
+
+        let surface = self.surfaces.get_mut(SurfaceId::Current);
+        if let Some(image) = surface.image_snapshot_with_bounds(irect) {
+            self.thumbnails.insert(
+                element.id,
+                CachedThumbnail {
+                    image,
+                    doc_rect,
+                    capture_scale: scale,
+                },
+            );
+        }
     }
 
     /// Combines every visible layer blur currently active (ancestors + shape)
@@ -2512,6 +2670,12 @@ impl RenderState {
                 if !node_render_state.flattened {
                     self.render_shape_exit(element, visited_mask, clip_bounds, target_surface)?;
                 }
+                // If we requested a thumbnail for this container, capture it now that the
+                // subtree has been rendered and composited into the Current surface.
+                if !export && target_surface == SurfaceId::Current {
+                    let scale = self.get_scale();
+                    self.maybe_capture_thumbnail(element, tree, scale);
+                }
                 continue;
             }
 
@@ -2551,6 +2715,15 @@ impl RenderState {
                 }
 
                 if !is_visible {
+                    continue;
+                }
+            }
+
+            // LOD/fallback: if we have (or can use) a thumbnail for an eligible
+            // top-level container, draw it and skip the full subtree render.
+            if !export && target_surface == SurfaceId::Current {
+                let scale = self.get_scale();
+                if self.maybe_draw_thumbnail(element, tree, scale) {
                     continue;
                 }
             }
