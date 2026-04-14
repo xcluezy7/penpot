@@ -40,7 +40,9 @@ pub use images::*;
 #[derive(Clone)]
 struct CachedThumbnail {
     image: skia::Image,
-    /// Document-space rectangle that the thumbnail should be drawn into.
+    /// Optional source rect (in image pixel coords) when the cached image contains margins.
+    src_rect: Option<skia::Rect>,
+    /// Document-space rect the thumbnail was generated for (used as draw dest).
     doc_rect: Rect,
     /// Scale of the view at capture time (best-effort heuristic/debug).
     capture_scale: f32,
@@ -490,10 +492,10 @@ impl RenderState {
 
     #[inline]
     fn thumb_lod_mode(&self, scale: f32) -> bool {
-        true
         // Phase 1 heuristic:
         // - Always allow thumbnails in fast mode (pan/zoom in progress).
         // - Also allow at very low zoom to reduce work.
+        true
         // const THUMB_ZOOM_THRESHOLD: f32 = 0.22;
         // self.options.is_fast_mode() || scale <= THUMB_ZOOM_THRESHOLD
     }
@@ -532,7 +534,10 @@ impl RenderState {
             let canvas = self.surfaces.canvas_and_mark_dirty(SurfaceId::Fills);
             canvas.draw_image_rect_with_sampling_options(
                 &cached.image,
-                None,
+                cached
+                    .src_rect
+                    .as_ref()
+                    .map(|r| (r, skia::canvas::SrcRectConstraint::Strict)),
                 cached.doc_rect,
                 self.sampling_options,
                 &skia::Paint::default(),
@@ -558,16 +563,20 @@ impl RenderState {
             return;
         }
 
-        // Capture the container's extrect in device pixels from the Current surface.
+        // IMPORTANT: do not call the export rendering path from within the workspace render
+        // loop. It mutates render surfaces / render context and would desynchronize the
+        // current tile transforms, causing mispositioned content.
+        //
+        // Phase 1 capture: snapshot the already-rendered Current surface for this tile.
         let doc_rect = element.extrect(tree, scale);
         let irect = self.doc_rect_to_surface_irect(doc_rect, scale);
-
         let surface = self.surfaces.get_mut(SurfaceId::Current);
         if let Some(image) = surface.image_snapshot_with_bounds(irect) {
             self.thumbnails.insert(
                 element.id,
                 CachedThumbnail {
                     image,
+                    src_rect: None,
                     doc_rect,
                     capture_scale: scale,
                 },
