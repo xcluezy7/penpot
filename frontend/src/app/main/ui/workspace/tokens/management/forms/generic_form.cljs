@@ -57,7 +57,6 @@
            action
            is-create
            selected-token-set-id
-           tokens-tree-in-selected-set
            token-type
            make-schema
            input-component
@@ -66,7 +65,11 @@
            value-subfield
            input-value-placeholder] :as props}]
 
-  (let [make-schema     (or make-schema #(-> (cfo/make-token-schema % token-type)
+  (let [make-schema     (or make-schema #(-> (cfo/make-token-schema %
+                                                                    token-type
+                                                                    selected-token-set-id
+                                                                    (when (ctob/token? token)
+                                                                      (ctob/get-id token)))
                                              (sm/dissoc-key :id)))
         input-component (or input-component token.controls/input*)
         validate-token  (or validator default-validate-token)
@@ -85,6 +88,8 @@
 
         tokens (mf/deref refs/workspace-all-tokens-map)
 
+        tokens-lib (mf/deref refs/tokens-lib)
+
         tokens-in-selected-set
         (mf/deref refs/workspace-all-tokens-in-selected-set)
 
@@ -102,8 +107,8 @@
           (delay (ctob/group-by-type tokens)))
 
         schema
-        (mf/with-memo [tokens-tree-in-selected-set active-tab]
-          (make-schema tokens-tree-in-selected-set active-tab))
+        (mf/with-memo [tokens-lib active-tab]
+          (make-schema tokens-lib active-tab))
 
         initial
         (mf/with-memo [token initial]

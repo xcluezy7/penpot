@@ -1477,49 +1477,54 @@ Will return a value that matches this schema:
           (rename copy-name)
           (reid (uuid/next))))))
 
-(defn- token-name->path-selector
-  "Splits token-name into map with `:path` and `:selector` using `token-name->path`.
-
-  `:selector` is the last item of the names path
-  `:path` is everything leading up the the `:selector`."
-  [token-name]
-  (let [path-segments (get-token-path {:name token-name})
-        last-idx (dec (count path-segments))
-        [path [selector]] (split-at last-idx path-segments)]
-    {:path (seq path)
-     :selector selector}))
-
 (defn token-name-path-exists?
-  "Traverses the path from `token-name` down a `tokens-tree` and checks if a token at that path exists.
+  "Check if a token name or fragment exists in any part of the library, to prevent creating
+   duplicated names that may clash when merging sets and resolving tokens.
 
-  It's not allowed to create a token inside a token. E.g.:
-  Creating a token with
+   Matches any combination of of names completely included inside group or token names.
+   For example:
+   - Matches the name \"foo.bar\" with an existing token named \"foo.bar.baz\" or \"foo\".
+   - Does not match the name \"foo.bar\" with an existing token named \"foo.baz\".
 
-    {:name \"foo.bar\"}
+   You can give a current set id, and it will check if there is a token with the exact same
+   name in this set (there may be tokens with same name in different sets for overriding
+   values, but not in the same set). You can also give a token id to ignore, to search for
+   a token that is a different one.
+  "
+  [token-name tokens-lib current-set-id token-id-to-ignore]
+  (letfn [(exists-in-set?
+            [set]
+            (let [tokens-tree (-> set (get-tokens-) (tokens-tree))]
+              (loop [path (get-token-path {:name token-name})
+                     subtree tokens-tree]
+                (let [node (get subtree (first path))]
+                  (if (empty? path)
+                    ;; All path segments found
+                    true
+                    (cond
+                      ;; Path segment doesn't exist
+                      (nil? node) false
+                      ;; A token exists at this path
+                      (token? node)
+                      (if (and (some? token-id-to-ignore)
+                               (= (get-id node) token-id-to-ignore))
+                        false
+                        (if (and (not= (get-id set) current-set-id)
+                                 (= (get-name node) token-name))
+                          false
+                          true))
+                      ;; Continue traversing the tree
+                      :else (recur (rest path) node)))))))]
 
-  in the tokens tree:
-
-    {\"foo\" {:name \"other\"}}"
-  [token-name tokens-tree]
-  (let [{:keys [path selector]} (token-name->path-selector token-name)
-        path-target (reduce
-                     (fn [acc cur]
-                       (let [target (get acc cur)]
-                         (cond
-                           ;; Path segment doesn't exist yet
-                           (nil? target) (reduced false)
-                           ;; A token exists at this path
-                           (:name target) (reduced true)
-                           ;; Continue traversing the true
-                           :else target)))
-                     tokens-tree
-                     path)]
-    (cond
-      (boolean? path-target) path-target
-      (get path-target :name) true
-      :else (-> (get path-target selector)
-                (seq)
-                (boolean)))))
+    (if (or (nil? tokens-lib) (empty? (get-sets tokens-lib))
+            (nil? token-name) (str/empty? token-name))
+      false
+      (do
+        (assert (or (nil? current-set-id)
+                    (some? (get-set tokens-lib current-set-id)))
+                (str "Set '" current-set-id "' does not exist in the library"))
+        (assert (or (nil? token-id-to-ignore) (uuid? token-id-to-ignore)))
+        (some exists-in-set? (get-sets tokens-lib))))))
 
 (defn update-tokens-group
   "Updates the active tokens path when renaming a group node.
@@ -1530,7 +1535,9 @@ Will return a value that matches this schema:
    active-tokens: map of token-name to token-object for all active tokens in the set
    current-path: the path of the group being renamed, e.g. \"foo.bar\"
    current-name: the current name of the group being renamed, e.g. \"bar\"
-   new-name: the new name for the group being renamed, e.g. \"baz\""
+   new-name: the new name for the group being renamed, e.g. \"baz\"
+   
+   Returns a sequence of [name token] for each renamed token."
 
   [active-tokens current-path current-name new-name]
   (let [path-prefix (str/replace current-path current-name "")]
@@ -1879,7 +1886,11 @@ Will return a value that matches this schema:
         library
         (reduce (fn [library name]
                   (if-let [tokens (get sets name)]
-                    (add-set library (make-token-set :name name :tokens tokens))
+                    (do (doseq [token (vals tokens)]
+                          (when (token-name-path-exists? (get-name token) library nil (get-id token))
+                            (throw (ex-info (get-name token)
+                                            {:error/code :error.import/duplicated-token-name}))))
+                        (add-set library (make-token-set :name name :tokens tokens)))
                     library))
                 library
                 ordered-set-names)

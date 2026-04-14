@@ -6,10 +6,7 @@
 
 (ns app.main.ui.workspace.tokens.management.forms.form-container
   (:require
-   [app.common.data :as d]
-   [app.common.types.tokens-lib :as ctob]
    [app.config :as cf]
-   [app.main.refs :as refs]
    [app.main.ui.workspace.tokens.management.forms.color :as color]
    [app.main.ui.workspace.tokens.management.forms.controls :as token.controls]
    [app.main.ui.workspace.tokens.management.forms.font-family :as font-family]
@@ -24,20 +21,8 @@
   (let [token-type
         (or (:type token) token-type)
 
-        tokens-in-selected-set
-        (mf/deref refs/workspace-all-tokens-in-selected-set)
-
-        token-path
-        (mf/with-memo [token]
-          (ctob/get-token-path token))
-
-        tokens-tree-in-selected-set
-        (mf/with-memo [token-path tokens-in-selected-set]
-          (-> (ctob/tokens-tree tokens-in-selected-set)
-              (d/dissoc-in token-path)))
         props
         (mf/spread-props props {:token-type token-type
-                                :tokens-tree-in-selected-set tokens-tree-in-selected-set
                                 :token token})
         text-case-props (mf/spread-props props {:input-value-placeholder (tr "workspace.tokens.text-case-value-enter")})
         text-decoration-props (mf/spread-props props {:input-value-placeholder (tr "workspace.tokens.text-decoration-value-enter")})
