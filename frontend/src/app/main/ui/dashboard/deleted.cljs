@@ -17,9 +17,10 @@
    [app.main.ui.components.context-menu-a11y :refer [context-menu*]]
    [app.main.ui.dashboard.grid :refer [grid*]]
    [app.main.ui.ds.buttons.button :refer [button*]]
+   [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
+   [app.main.ui.ds.foundations.assets.icon :as i]
    [app.main.ui.ds.product.empty-placeholder :refer [empty-placeholder*]]
    [app.main.ui.hooks :as hooks]
-   [app.main.ui.icons :as deprecated-icon]
    [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer [tr]]
    [app.util.keyboard :as kbd]
@@ -28,9 +29,6 @@
 
 (def ^:private ref:deleted-files
   (l/derived :deleted-files st/state))
-
-(def ^:private menu-icon
-  (deprecated-icon/icon-xref :menu (stl/css :menu-icon)))
 
 (defn- on-restore-project
   [project]
@@ -151,14 +149,13 @@
        (when (:deleted-at project)
          [:div {:class (stl/css :info-wrapper)}
           [:div {:class (stl/css-case :project-actions true)}
-
-           [:button {:class (stl/css :options-btn)
-                     :on-click on-menu-click
-                     :title (tr "dashboard.options")
-                     :aria-label  (tr "dashboard.options")
-                     :data-testid "project-options"
-                     :on-key-down handle-menu-click}
-            menu-icon]]
+           [:> icon-button* {:variant "ghost"
+                             :aria-pressed (:menu-open @local)
+                             :aria-label (tr "labels.options")
+                             :on-click on-menu-click
+                             :on-key-down handle-menu-click
+                             :data-testid "project-options"
+                             :icon i/menu}]]
 
           (when (:menu-open @local)
             [:> project-context-menu*
@@ -294,13 +291,15 @@
         (if (seq projects)
           [:*
            [:div {:class (stl/css :deleted-info-content)}
-            [:p {:class (stl/css :deleted-info)}
-             (tr "dashboard.trash-info-text-part1")
-             [:span {:class (stl/css :info-text-highlight)}
-              (tr "dashboard.trash-info-text-part2" deletion-days)]
-             (tr "dashboard.trash-info-text-part3")
-             [:br]
-             (tr "dashboard.trash-info-text-part4")]
+            [:div
+             [:p {:class (stl/css :deleted-info)}
+              (tr "dashboard.trash-info-text-part1")
+              [:span {:class (stl/css :info-text-highlight)}
+               (tr "dashboard.trash-info-text-part2" deletion-days)]
+              (tr "dashboard.trash-info-text-part3")]
+             [:p {:class (stl/css :deleted-info)}
+              (tr "dashboard.trash-info-text-part4")]]
+
             [:div {:class (stl/css :deleted-options)}
              [:> button* {:variant "ghost"
                           :type "button"

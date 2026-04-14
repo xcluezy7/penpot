@@ -28,7 +28,7 @@
   width: calc(100% - $sz-12);
   pointer-events: none;
   z-index: var(--z-index-dropdown);
-  
+
   &.collapsed {
     inset-block-end: calc(-1 * px2rem(228));
     background-color: transparent;

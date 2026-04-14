@@ -4,7 +4,6 @@
 //
 // Copyright (c) KALEIDOS INC
 
-@use "refactor/common-refactor.scss" as deprecated;
 @use "common/refactor/common-dashboard";
 @use "ds/spacing.scss" as *;
 @use "ds/typography.scss" as t;
@@ -28,12 +27,8 @@
 }
 
 .deleted-info {
-  display: block;
-  height: fit-content;
   color: var(--color-foreground-secondary);
   @include t.use-typography("body-large");
-  line-height: 0.8;
-  height: var(--sp-xl);
 }
 
 .info-text-highlight {
@@ -42,7 +37,7 @@
 
 .deleted-options {
   display: flex;
-  gap: 5px;
+  gap: var(--sp-s);
   flex-shrink: 0;
 }
 
@@ -114,23 +109,8 @@
   margin-inline-start: var(--sp-xxxl);
 }
 
-.add-file-btn,
-.options-btn {
-  @extend .button-tertiary;
-  height: var(--sp-xxxl);
-  width: var(--sp-xxxl);
-  margin: 0 var(--sp-s);
-  padding: var(--sp-s);
-}
-
 .info-wrapper {
   display: flex;
   align-items: center;
   gap: var(--sp-s);
-}
-
-.add-icon,
-.menu-icon {
-  @extend .button-icon;
-  stroke: var(--icon-foreground);
 }
