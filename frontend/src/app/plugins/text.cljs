@@ -25,8 +25,7 @@
    [app.plugins.utils :as u]
    [app.util.object :as obj]
    [app.util.text-editor :as ted]
-   [cuerdas.core :as str]
-   [potok.v2.core :as ptk]))
+   [cuerdas.core :as str]))
 
 ;; This regex seems duplicated but probably in the future when we support diferent units
 ;; this will need to reflect changes for each property

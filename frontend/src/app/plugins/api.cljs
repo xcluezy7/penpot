@@ -27,7 +27,9 @@
    [app.main.data.workspace.colors :as dwc]
    [app.main.data.workspace.groups :as dwg]
    [app.main.data.workspace.media :as dwm]
+   [app.main.data.workspace.modifiers :as dwmm]
    [app.main.data.workspace.selection :as dws]
+   [app.main.data.workspace.shape-layout :as dwsl]
    [app.main.data.workspace.variants :as dwv]
    [app.main.data.workspace.wasm-text :as dwwt]
    [app.main.features :as features]
@@ -660,14 +662,30 @@
     (fn [timeout]
       (js/Promise.
        (fn [resolve reject]
-         (->> (rx/combine-latest-all
-               [(if timeout
-                  (->> (rx/of :timeout)
-                       (rx/delay timeout))
-                  (rx/empty))
+         (->> (rx/merge
+               (if timeout
+                 (->> (rx/of :timeout)
+                      (rx/delay timeout))
+                 (rx/empty))
 
-                ;; TODO: Wait for the layout to update
-              ])
+               ;; Estas dos operaciones seria "take last" y luego tambien esta que
+               ;; hay que ver lo de la fuente.
+               (if @dwsl/layout-pending
+                 (->> st/stream
+                      (rx/filter (ptk/type? ::dwsl/update-layout-positions))
+                      (rx/take 1))
+                 (rx/empty))
+
+               (if @dwwt/resize-pending
+                 (->> st/stream
+                      (rx/filter (ptk/type? ::dwmm/apply-wasm-modifiers))
+                      (rx/take 1))
+                 (rx/empty))
+
+               (if (and (not @dwwt/resize-pending)
+                        (not @dwsl/layout-pending))
+                 (rx/of :ok)
+                 (rx/empty)))
               (rx/take 1)
               (rx/subs!
                (fn [value]
