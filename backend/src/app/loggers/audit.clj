@@ -269,17 +269,33 @@
       ;; this case we just retry the operation.
       (append-audit-entry cfg params))
 
-    (when (and (or (contains? cf/flags :telemetry)
-                   (cf/get :telemetry-enabled))
+    (when (and cf/telemetry-enabled?
                (not (contains? cf/flags :audit-log)))
       ;; NOTE: this operation may cause primary key conflicts on inserts
       ;; because of the timestamp precission (two concurrent requests), in
       ;; this case we just retry the operation.
       ;;
-      ;; NOTE: this is only executed when general audit log is disabled
-      (let [params (-> params
+      ;; NOTE: this is only executed when general audit log is disabled;
+      ;; events are stored stripped of props and ip-addr, tagged with
+      ;; source="telemetry" so the telemetry task can collect and ship
+      ;; them.  The profile-id is preserved (UUIDs are already anonymous
+      ;; random identifiers).  Only a safe subset of context fields is
+      ;; kept: initiator, version, client-version and client-user-agent.
+      ;; Timestamps are truncated to day precision to avoid leaking exact
+      ;; event timing.
+      (let [tday         (ct/truncate tnow :days)
+            safe-context (-> (:context params {})
+                             (select-keys [:initiator
+                                           :version
+                                           :client-version
+                                           :client-user-agent]))
+            params (-> params
+                       (assoc :source "telemetry")
                        (assoc :props {})
-                       (assoc :context {}))]
+                       (assoc :context safe-context)
+                       (assoc :ip-addr (db/inet "0.0.0.0"))
+                       (assoc :created-at tday)
+                       (assoc :tracked-at tday))]
         (append-audit-entry cfg params)))
 
     (when (and (contains? cf/flags :webhooks)
