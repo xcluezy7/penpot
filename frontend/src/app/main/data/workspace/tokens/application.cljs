@@ -54,34 +54,37 @@
   ([value shape-ids attributes page-id]
    (when (number? value)
      (let [value (max 0 value)]
-       (dwsh/update-shapes shape-ids
-                           (fn [shape]
-                             (ctsr/set-radius-for-corners shape attributes value))
-                           {:reg-objects? true
-                            :ignore-touched true
-                            :page-id page-id
-                            :attrs ctt/border-radius-keys})))))
+       (dwsh/update-shapes-debounce
+        shape-ids
+        (fn [shape]
+          (ctsr/set-radius-for-corners shape attributes value))
+        {:reg-objects? true
+         :ignore-touched true
+         :page-id page-id
+         :attrs ctt/border-radius-keys})))))
 
 (defn update-shape-radius-for-corners
   ([value shape-ids attributes] (update-shape-radius-for-corners value shape-ids attributes nil))
   ([value shape-ids attributes page-id]
    (when (number? value)
      (let [value (max 0 value)]
-       (dwsh/update-shapes shape-ids
-                           (fn [shape]
-                             (ctsr/set-radius-for-corners shape attributes value))
-                           {:reg-objects? true
-                            :ignore-touched true
-                            :page-id page-id
-                            :attrs ctt/border-radius-keys})))))
+       (dwsh/update-shapes-debounce
+        shape-ids
+        (fn [shape]
+          (ctsr/set-radius-for-corners shape attributes value))
+        {:reg-objects? true
+         :ignore-touched true
+         :page-id page-id
+         :attrs ctt/border-radius-keys})))))
 (defn update-opacity
   ([value shape-ids attributes] (update-opacity value shape-ids attributes nil))
   ([value shape-ids _attributes page-id] ; The attributes param is needed to have the same arity that other update functions
    (when (<= 0 value 1)
-     (dwsh/update-shapes shape-ids
-                         #(assoc % :opacity value)
-                         {:ignore-touched true
-                          :page-id page-id}))))
+     (dwsh/update-shapes-debounce
+      shape-ids
+      #(assoc % :opacity value)
+      {:ignore-touched true
+       :page-id page-id}))))
 
 ;; FIXME: if attributes are not always present, maybe we have an
 ;; options here for pass optional value and preserve the correct and
@@ -104,16 +107,17 @@
   ([value shape-ids attributes] (update-stroke-width value shape-ids attributes nil))
   ([value shape-ids _attributes page-id] ; The attributes param is needed to have the same arity that other update functions
    (when (number? value)
-     (dwsh/update-shapes shape-ids
-                         (fn [shape]
-                           (if (seq (:strokes shape))
-                             (assoc-in shape [:strokes 0 :stroke-width] value)
-                             (let [stroke (assoc cts/default-stroke :stroke-width value)]
-                               (assoc shape :strokes [stroke]))))
-                         {:reg-objects? true
-                          :ignore-touched true
-                          :page-id page-id
-                          :attrs [:strokes]}))))
+     (dwsh/update-shapes-debounce
+      shape-ids
+      (fn [shape]
+        (if (seq (:strokes shape))
+          (assoc-in shape [:strokes 0 :stroke-width] value)
+          (let [stroke (assoc cts/default-stroke :stroke-width value)]
+            (assoc shape :strokes [stroke]))))
+      {:reg-objects? true
+       :ignore-touched true
+       :page-id page-id
+       :attrs [:strokes]}))))
 
 (defn update-color [f value shape-ids page-id]
   (when-let [tc (tinycolor/valid-color value)]
@@ -149,11 +153,12 @@
   ;; The attributes param is needed to have the same arity that other update functions
   ([value shape-ids _attributes page-id]
    (when-let [color (value->color value)]
-     (dwsh/update-shapes shape-ids
-                         #(wdc/update-shape-stroke-color % 0 color)
-                         {:page-id page-id
-                          :ignore-touched true
-                          :changed-sub-attr [:stroke-color]}))))
+     (dwsh/update-shapes-debounce
+      shape-ids
+      #(wdc/update-shape-stroke-color % 0 color)
+      {:page-id page-id
+       :ignore-touched true
+       :changed-sub-attr [:stroke-color]}))))
 
 (defn value->shadow
   "Transform a token shadow value into penpot shadow data structure"
@@ -178,12 +183,13 @@
   ([value shape-ids _attributes page-id]
    (when (sequential? value)
      (let [shadows (value->shadow value)]
-       (dwsh/update-shapes shape-ids
-                           #(assoc % :shadow shadows)
-                           {:reg-objects? true
-                            :ignore-touched true
-                            :page-id page-id
-                            :attrs [:shadow]})))))
+       (dwsh/update-shapes-debounce
+        shape-ids
+        #(assoc % :shadow shadows)
+        {:reg-objects? true
+         :ignore-touched true
+         :page-id page-id
+         :attrs [:shadow]})))))
 
 (defn update-fill-stroke
   ([value shape-ids attributes]
@@ -300,10 +306,11 @@
     (ptk/reify ::generate-text-shape-update
       ptk/WatchEvent
       (watch [_ state _]
-        (cond-> (rx/of (dwsh/update-shapes shape-ids
-                                           #(txt/update-text-content % update-node? update-fn nil)
-                                           {:ignore-touched true
-                                            :page-id page-id}))
+        (cond-> (rx/of (dwsh/update-shapes-debounce
+                        shape-ids
+                        #(txt/update-text-content % update-node? update-fn nil)
+                        {:ignore-touched true
+                         :page-id page-id}))
           (and affects-layout?
                (features/active-feature? state "render-wasm/v1"))
           (rx/merge
@@ -359,11 +366,12 @@
     (ptk/reify ::generate-font-family-text-shape-update
       ptk/WatchEvent
       (watch [_ state _]
-        (cond-> (rx/of (dwsh/update-shapes shape-ids
-                                           (fn [shape]
-                                             (txt/update-text-content shape update-node? #(update-fn %1 (ctst/font-weight-applied? shape)) nil))
-                                           {:ignore-touched true
-                                            :page-id page-id}))
+        (cond-> (rx/of (dwsh/update-shapes-debounce
+                        shape-ids
+                        (fn [shape]
+                          (txt/update-text-content shape update-node? #(update-fn %1 (ctst/font-weight-applied? shape)) nil))
+                        {:ignore-touched true
+                         :page-id page-id}))
           (features/active-feature? state "render-wasm/v1")
           (rx/merge
            (rx/of (dwwt/resize-wasm-text-all shape-ids))))))))
@@ -437,10 +445,11 @@
     (ptk/reify ::generate-font-weight-text-shape-update
       ptk/WatchEvent
       (watch [_ state _]
-        (cond-> (rx/of (dwsh/update-shapes shape-ids
-                                           #(txt/update-text-content % update-node? update-fn nil)
-                                           {:ignore-touched true
-                                            :page-id page-id}))
+        (cond-> (rx/of (dwsh/update-shapes-debounce
+                        shape-ids
+                        #(txt/update-text-content % update-node? update-fn nil)
+                        {:ignore-touched true
+                         :page-id page-id}))
           (features/active-feature? state "render-wasm/v1")
           (rx/merge
            (rx/of (dwwt/resize-wasm-text-all shape-ids))))))))
@@ -491,7 +500,7 @@
    (ptk/reify ::update-shape-dimensions
      ptk/WatchEvent
      (watch [_ _ _]
-       (when (number? value)
+       #_(when (number? value)
          (rx/of
           (when (:width attributes) (dwtr/update-dimensions shape-ids :width value {:ignore-touched true :page-id page-id}))
           (when (:height attributes) (dwtr/update-dimensions shape-ids :height value {:ignore-touched true :page-id page-id}))))))))
@@ -709,12 +718,14 @@
                                                :applied-to attributes
                                                :applied-to-variant any-variant?}))
                           (dwu/start-undo-transaction undo-id)
-                          (dwsh/update-shapes shape-ids (fn [shape]
-                                                          (cond-> shape
-                                                            attributes-to-remove
-                                                            (update :applied-tokens #(apply (partial dissoc %) attributes-to-remove))
-                                                            :always
-                                                            (update :applied-tokens merge tokenized-attributes)))))
+                          (dwsh/update-shapes-debounce
+                           shape-ids
+                           (fn [shape]
+                             (cond-> shape
+                               attributes-to-remove
+                               (update :applied-tokens #(apply (partial dissoc %) attributes-to-remove))
+                               :always
+                               (update :applied-tokens merge tokenized-attributes)))))
                          (when on-update-shape
                            (let [res (on-update-shape resolved-value shape-ids attributes)]
                              ;; Composed updates return observables and need to be executed differently
@@ -765,7 +776,7 @@
     (watch [_ _ _]
       (rx/of
        (let [remove-token #(when % (cfo/remove-attributes-for-token attributes token-name %))]
-         (dwsh/update-shapes
+         (dwsh/update-shapes-debounce
           shape-ids
           (fn [shape]
             (update shape :applied-tokens remove-token))))))))

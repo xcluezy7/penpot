@@ -697,6 +697,7 @@
   [modif-tree & {:keys [ignore-constraints ignore-snap-pixel snap-ignore-axis undo-transation?]
                  :or {ignore-constraints false ignore-snap-pixel false snap-ignore-axis nil undo-transation? true}
                  :as params}]
+  (.trace js/console "apply-wasm-modifiers")
   (ptk/reify ::apply-wasm-modifiesr
     ptk/WatchEvent
     (watch [_ state _]

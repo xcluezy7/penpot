@@ -46,8 +46,98 @@
 
     (cond-> changes add-undo-group? (assoc :undo-group undo-group))))
 
+(defn update-shapes-debounce-start
+  []
+  (ptk/reify ::update-shapes-debounce-start
+    ptk/UpdateEvent
+    (update [_ state]
+      (assoc state ::update-shapes-debounce true))))
+
+(defn update-shapes-debounce-stop
+  []
+  (ptk/reify ::update-shapes-debounce-start
+    ptk/UpdateEvent
+    (update [_ state]
+      (assoc state ::update-shapes-debounce false))))
+
+(defn update-shapes-debounce-commit
+  []
+  (ptk/reify ::update-shapes-debounce-commit
+    ptk/WatchEvent
+    (watch [_ state _]
+      ;; (prn ">update-shapes-debounce-commit")
+      (let [changes (get state ::update-shapes-debounce-changes)]
+
+        (.log js/console (clj->js changes))
+
+        (rx/of (dch/commit-changes changes))
+        ))))
+
+(def ^:private ^:constant update-shapes-debounce-time 40)
+
+(defn update-shapes-debounce
+  ([ids update-fn]
+   (update-shapes-debounce ids update-fn nil))
+  ([ids update-fn
+    {:keys [reg-objects? save-undo? stack-undo? attrs ignore-tree page-id
+            ignore-touched undo-group with-objects? changed-sub-attr]
+     :or {reg-objects? false
+          save-undo? true
+          stack-undo? false
+          ignore-touched false
+          with-objects? false}
+     :as props}]
+
+   (let [cur-event (js/Symbol)]
+     (ptk/reify ::update-shapes-debounce
+       ptk/UpdateEvent
+       (update [it state]
+         ;;(prn ">update-shapes-debounce")
+         (let [page-id (or page-id (get state :current-page-id))
+               objects   (dsh/lookup-page-objects state page-id)]
+           (-> state
+               (cond-> (nil? (::update-shapes-debounce-event state))
+                 (-> (assoc ::update-shapes-debounce-event cur-event)
+                     (assoc ::update-shapes-debounce-changes
+                            (-> (pcb/empty-changes it page-id)
+                                (pcb/set-save-undo? save-undo?)
+                                (pcb/set-stack-undo? stack-undo?)
+                                (cond-> undo-group
+                                  (pcb/set-undo-group undo-group))))))
+
+               (update ::update-shapes-debounce-changes
+                       #(-> %
+                            (cls/generate-update-shapes ids
+                                                        update-fn
+                                                        objects
+                                                        {:attrs attrs
+                                                         :changed-sub-attr changed-sub-attr
+                                                         :ignore-tree ignore-tree
+                                                         :ignore-touched ignore-touched
+                                                         :with-objects? with-objects?})
+                            (cond-> reg-objects? (pcb/resize-parents ids)))))))
+       ptk/WatchEvent
+       (watch [it state stream]
+         (if (= (::update-shapes-debounce-event state) cur-event)
+           (let [stopper (->> stream (rx/filter (ptk/type? :app.main.data.workspace/finalize)))]
+             (rx/concat
+              (rx/merge
+               (->> stream
+                    (rx/filter (ptk/type? ::update-shapes-debounce))
+                    (rx/debounce update-shapes-debounce-time)
+                    (rx/take 1)
+                    (rx/map #(update-shapes-debounce-commit))
+                    (rx/take-until stopper))
+               (rx/of (update-shapes-debounce ids update-fn props)))
+
+              (rx/of #(dissoc %
+                              ::update-shapes-debounce-changes
+                              ::update-shapes-debounce-event))))
+           (rx/empty)))))))
+
 (defn update-shapes
-  ([ids update-fn] (update-shapes ids update-fn nil))
+  ([ids update-fn]
+   (update-shapes ids update-fn nil))
   ([ids update-fn
     {:keys [reg-objects? save-undo? stack-undo? attrs ignore-tree page-id
             ignore-touched undo-group with-objects? changed-sub-attr]
@@ -57,12 +147,14 @@
           ignore-touched false
           with-objects? false}}]
 
+   ;;(.trace js/console "update-shapes")
    (assert (every? uuid? ids) "expect a coll of uuid for `ids`")
    (assert (fn? update-fn) "the `update-fn` should be a valid function")
 
    (ptk/reify ::update-shapes
      ptk/WatchEvent
      (watch [it state _]
+       ;;(prn "!! update-shapes")
        (let [page-id   (or page-id (get state :current-page-id))
              objects   (dsh/lookup-page-objects state page-id)
              ids       (into [] (filter some?) ids)

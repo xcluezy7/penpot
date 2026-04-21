@@ -195,5 +195,6 @@
   (ptk/reify ::resize-wasm-text-all
     ptk/WatchEvent
     (watch [_ _ _]
-      (->> (rx/from ids)
-           (rx/map resize-wasm-text-debounce)))))
+      #_(->> (rx/from ids)
+             (rx/map resize-wasm-text-debounce))
+      (rx/empty))))

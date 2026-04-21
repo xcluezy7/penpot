@@ -298,11 +298,12 @@
                                keys
                                set)]
          (rx/of (dwu/start-undo-transaction undo-id)
-                (dwsh/update-shapes ids (d/patch-object changes)
-                                    (cond-> options
-                                      (seq padding-attrs)
-                                      (assoc :changed-sub-attr padding-attrs)))
-                (ptk/data-event :layout/update {:ids ids})
+                (dwsh/update-shapes-debounce
+                 ids (d/patch-object changes)
+                 (cond-> options
+                   (seq padding-attrs)
+                   (assoc :changed-sub-attr padding-attrs)))
+                ;;(ptk/data-event :layout/update {:ids ids})
                 (dwu/commit-undo-transaction undo-id)
                 (when (or (:layout-align-content changes) (:layout-justify-content changes))
                   (ptk/event ::ev/event

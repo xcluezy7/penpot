@@ -60,7 +60,7 @@
     (ptk/reify ::update-shape
       ptk/WatchEvent
       (watch [_ _ _]
-        (rx/of (dwsh/update-shapes [id] #(merge % attrs)))))))
+        (rx/of (dwsh/update-shapes-debounce [id] #(merge % attrs)))))))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

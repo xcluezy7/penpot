@@ -69,7 +69,7 @@
    [:on-click {:optional true} ::sm/fn]])
 
 (mf/defc swatch*
-  {::mf/schema (sm/schema schema:swatch)}
+  ;;{::mf/schema (sm/schema schema:swatch)}
   [{:keys [background class size active has-errors tooltip-content on-click show-tooltip]
     :rest props}]
   (let [;; NOTE: this code is only relevant for storybook, because

@@ -6,6 +6,7 @@
 
 (ns app.main.data.workspace.tokens.propagation
   (:require
+   [app.main.data.workspace.shapes :as dwsh]
    [app.common.data :as d]
    [app.common.files.helpers :as cfh]
    [app.common.logging :as l]
@@ -173,15 +174,17 @@
                                  (rx/of (dwt/clear-thumbnail file-id page-id frame-id "frame")
                                         (dwt/clear-thumbnail file-id page-id frame-id "component")))))
                (when (not= page-id current-page-id)   ;; Texts in the current page have already their position-data regenerated
-                 (rx/of (dwsh/update-shapes text-ids  ;; after change. But those on other pages need to be specifically reset.
-                                            (fn [shape]
-                                              (dissoc shape :position-data))
-                                            {:page-id page-id
-                                             :ignore-touched true})))))))
+                 (rx/of (dwsh/update-shapes-debounce
+                         text-ids  ;; after change. But those on other pages need to be specifically reset.
+                         (fn [shape]
+                           (dissoc shape :position-data))
+                         {:page-id page-id
+                          :ignore-touched true})))))))
          (rx/finalize
           (fn [_]
             (let [elapsed (tpoint)]
               (l/inf :status "END" :hint "propagate-tokens" :elapsed elapsed)))))))
+
 
 (defn propagate-workspace-tokens
   []
@@ -195,9 +198,12 @@
                (rx/of (-> (ts/resolve-tokens tokens-tree)
                           (d/update-vals #(update % :resolved-value ts/tokenscript-symbols->penpot-unit))))
                (sd/resolve-tokens tokens-tree))
-             (rx/mapcat (fn [sd-tokens]
-                          (let [undo-id (js/Symbol)]
-                            (rx/concat
-                             (rx/of (dwu/start-undo-transaction undo-id :timeout false))
-                             (propagate-tokens state sd-tokens)
-                             (rx/of (dwu/commit-undo-transaction undo-id)))))))))))
+             (rx/mapcat
+              (fn [sd-tokens]
+                (let [undo-id (js/Symbol)]
+                  (rx/concat
+                   (rx/of (dwu/start-undo-transaction undo-id :timeout false))
+                   (rx/of (dwsh/update-shapes-debounce-start))
+                   (propagate-tokens state sd-tokens)
+                   (rx/of (dwsh/update-shapes-debounce-stop))
+                   (rx/of (dwu/commit-undo-transaction undo-id)))))))))))

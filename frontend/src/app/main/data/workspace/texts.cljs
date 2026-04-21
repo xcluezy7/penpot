@@ -534,7 +534,7 @@
                      (dissoc :fills)
                      (d/update-when :content update-content)))]
 
-           (rx/concat (rx/of (dwsh/update-shapes shape-ids update-shape options))
+           (rx/concat (rx/of (dwsh/update-shapes-debounce shape-ids update-shape options))
                       (when (features/active-feature? state "text-editor-wasm/v1")
                         (let [styles ((comp update-node-fn migrate-node))
                               result (wasm.api/apply-styles-to-selection styles)]

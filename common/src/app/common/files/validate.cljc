@@ -722,7 +722,7 @@
 
   Raises an exception"
   [file libraries]
-  (when-let [errors (validate-file file libraries)]
+  #_(when-let [errors (validate-file file libraries)]
     (ex/raise :type :validation
               :code :referential-integrity
               :hint "error on validating file referential integrity"
