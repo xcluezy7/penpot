@@ -14,6 +14,12 @@ pub struct RenderOptions {
     /// keeps per-frame flushing enabled (unlike pan/zoom, where
     /// `render_from_cache` drives target presentation).
     interactive_transform: bool,
+    /// Opt-in switch for the retained-mode rendering path: when
+    /// enabled, top-level shapes are rasterized once to a `ShapeCache`
+    /// and recomposed every frame applying their modifier matrix as a
+    /// canvas transform, instead of being re-rasterized from scratch.
+    /// Behaves like the SVG compositor in the browser.
+    retained_mode: bool,
     /// Minimum on-screen size (CSS px at 1:1 zoom) above which vector antialiasing is enabled.
     pub antialias_threshold: f32,
 }
@@ -25,6 +31,7 @@ impl Default for RenderOptions {
             dpr: None,
             fast_mode: false,
             interactive_transform: false,
+            retained_mode: false,
             antialias_threshold: 7.0,
         }
     }
@@ -58,6 +65,17 @@ impl RenderOptions {
 
     pub fn set_interactive_transform(&mut self, enabled: bool) {
         self.interactive_transform = enabled;
+    }
+
+    /// Returns `true` when the retained-mode compositor should own the
+    /// render loop. Mirrors the Figma-style "one texture per top-level
+    /// shape" approach.
+    pub fn is_retained_mode(&self) -> bool {
+        self.retained_mode
+    }
+
+    pub fn set_retained_mode(&mut self, enabled: bool) {
+        self.retained_mode = enabled;
     }
 
     /// True only when the viewport is the one being moved (pan/zoom)

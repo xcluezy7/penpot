@@ -437,6 +437,26 @@ pub extern "C" fn set_modifiers_end() -> Result<()> {
     Ok(())
 }
 
+/// Toggle the retained-mode compositor. When enabled, the render
+/// loop takes a Figma-style "one texture per top-level shape" path
+/// (`render_retained`) instead of the tile pipeline: dragging a shape
+/// becomes a pure canvas transform on the cached texture, and no
+/// re-rasterization happens until the shape itself is edited.
+///
+/// Exposed as a boolean flag so the frontend can A/B test against the
+/// existing renderer while the retained path is still experimental.
+#[no_mangle]
+#[wasm_error]
+pub extern "C" fn set_retained_mode_enabled(enabled: bool) -> Result<()> {
+    with_state_mut!(state, {
+        state.render_state.options.set_retained_mode(enabled);
+        if !enabled {
+            state.render_state.shape_cache.clear();
+        }
+    });
+    Ok(())
+}
+
 #[no_mangle]
 #[wasm_error]
 pub extern "C" fn clear_focus_mode() -> Result<()> {

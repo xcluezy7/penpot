@@ -94,11 +94,17 @@ impl State {
     }
 
     pub fn render_sync(&mut self, timestamp: i32) -> Result<()> {
+        if self.render_state.options.is_retained_mode() {
+            return self.render_state.render_retained(&mut self.shapes, timestamp);
+        }
         self.render_state
             .start_render_loop(None, &self.shapes, timestamp, true)
     }
 
     pub fn render_sync_shape(&mut self, id: &Uuid, timestamp: i32) -> Result<()> {
+        if self.render_state.options.is_retained_mode() {
+            return self.render_state.render_retained(&mut self.shapes, timestamp);
+        }
         self.render_state
             .start_render_loop(Some(id), &self.shapes, timestamp, true)
     }
@@ -114,6 +120,10 @@ impl State {
     }
 
     pub fn start_render_loop(&mut self, timestamp: i32) -> Result<()> {
+        if self.render_state.options.is_retained_mode() {
+            return self.render_state.render_retained(&mut self.shapes, timestamp);
+        }
+
         // If zoom changed (e.g. interrupted zoom render followed by pan), the
         // tile index may be stale for the new viewport position. Rebuild the
         // index so shapes are mapped to the correct tiles. We use
@@ -129,6 +139,13 @@ impl State {
     }
 
     pub fn process_animation_frame(&mut self, timestamp: i32) -> Result<()> {
+        if self.render_state.options.is_retained_mode() {
+            // In retained mode there is no tile pipeline driving
+            // incremental progress: every frame is composed in a
+            // single pass inside `render_retained`, so animation
+            // frames are a no-op.
+            return Ok(());
+        }
         self.render_state
             .process_animation_frame(None, &self.shapes, timestamp)
     }

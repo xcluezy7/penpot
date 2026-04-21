@@ -7,6 +7,7 @@ pub mod grid_layout;
 mod images;
 mod options;
 mod shadows;
+mod shape_cache;
 mod strokes;
 mod surfaces;
 pub mod text;
@@ -15,7 +16,7 @@ mod ui;
 
 use skia_safe::{self as skia, Matrix, RRect, Rect};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 
 use gpu_state::GpuState;
 
@@ -36,6 +37,7 @@ use crate::wapi;
 
 pub use fonts::*;
 pub use images::*;
+pub use shape_cache::{ShapeCache, ShapeCacheEntry};
 
 // This is the extra area used for tile rendering (tiles beyond viewport).
 // Higher values pre-render more tiles, reducing empty squares during pan but using more memory.
@@ -343,6 +345,11 @@ pub(crate) struct RenderState {
     /// Cleared at the beginning of a render pass; set to true after we clear Cache the first
     /// time we are about to blit a tile into Cache for this pass.
     pub cache_cleared_this_render: bool,
+    /// Retained-mode compositor cache: one entry per top-level shape
+    /// holding its rasterized subtree. Populated on demand by
+    /// `render_retained` and invalidated automatically by comparing
+    /// `captured_version` against the current `ShapesPool::shape_version`.
+    pub shape_cache: ShapeCache,
 }
 
 pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
@@ -416,6 +423,7 @@ impl RenderState {
             preview_mode: false,
             export_context: None,
             cache_cleared_this_render: false,
+            shape_cache: ShapeCache::new(),
         })
     }
 
@@ -1905,6 +1913,289 @@ impl RenderState {
         }
 
         Ok((data.as_bytes().to_vec(), width, height))
+    }
+
+    /// Rasterize `id` and its whole subtree into a standalone
+    /// `SkImage`, using the regular render pipeline against the Export
+    /// surface. Intended for the retained-mode shape cache: returns the
+    /// image plus the document-space rectangle it corresponds to, so
+    /// the compositor can blit it back with `draw_image_rect`.
+    ///
+    /// Mirrors `render_shape_pixels` but skips PNG encoding and does
+    /// not touch workspace-facing scale/context any more than strictly
+    /// necessary — every piece of mutable state it temporarily flips
+    /// is saved and restored before returning.
+    fn capture_shape_image(
+        &mut self,
+        id: &Uuid,
+        tree: ShapesPoolRef,
+        scale: f32,
+        timestamp: i32,
+    ) -> Result<Option<(skia::Image, Rect)>> {
+        if tree.len() == 0 {
+            return Ok(None);
+        }
+        let Some(shape) = tree.get(id) else {
+            return Ok(None);
+        };
+
+        let target_surface = SurfaceId::Export;
+
+        // Save every bit of state the regular pipeline uses so the
+        // capture is fully isolated from the workspace render.
+        let saved_focus_mode = self.focus_mode.clone();
+        let saved_export_context = self.export_context;
+        let saved_render_area = self.render_area;
+        let saved_render_area_with_margins = self.render_area_with_margins;
+        let saved_current_tile = self.current_tile;
+        let saved_pending_nodes = std::mem::take(&mut self.pending_nodes);
+        let saved_nested_fills = std::mem::take(&mut self.nested_fills);
+        let saved_nested_blurs = std::mem::take(&mut self.nested_blurs);
+        let saved_nested_shadows = std::mem::take(&mut self.nested_shadows);
+        let saved_ignore_nested_blurs = self.ignore_nested_blurs;
+        let saved_preview_mode = self.preview_mode;
+
+        self.focus_mode.clear();
+        self.surfaces
+            .canvas(target_surface)
+            .clear(skia::Color::TRANSPARENT);
+
+        let extrect = shape.extrect(tree, scale);
+        // Bail on degenerate geometry to avoid trying to resize a
+        // zero-area Export surface.
+        if extrect.is_empty() {
+            // Restore everything and report "nothing to cache".
+            self.focus_mode = saved_focus_mode;
+            self.export_context = saved_export_context;
+            self.render_area = saved_render_area;
+            self.render_area_with_margins = saved_render_area_with_margins;
+            self.current_tile = saved_current_tile;
+            self.pending_nodes = saved_pending_nodes;
+            self.nested_fills = saved_nested_fills;
+            self.nested_blurs = saved_nested_blurs;
+            self.nested_shadows = saved_nested_shadows;
+            self.ignore_nested_blurs = saved_ignore_nested_blurs;
+            self.preview_mode = saved_preview_mode;
+            return Ok(None);
+        }
+
+        self.export_context = Some((extrect, scale));
+        let margins = self.surfaces.margins;
+        // `render_shape_pixels` offsets the render area by the margins
+        // so the intermediate surfaces (Fills/Strokes/shadows) have
+        // headroom for background-blur sampling. The offset is NOT a
+        // relocation of the shape in document space — the resulting
+        // Export image still covers the shape's original extrect; the
+        // offset only feeds `update_render_context`'s internal
+        // translation so pixels land centered inside the surface.
+        //
+        // Keep `source_doc_rect = extrect` (without the offset) so the
+        // retained compositor blits the texture at the exact location
+        // the shape occupies in document space — otherwise every
+        // top-level shape appears shifted by `margins / scale` units.
+        let offset_extrect = {
+            let mut r = extrect;
+            r.offset((margins.width as f32 / scale, margins.height as f32 / scale));
+            r
+        };
+
+        self.surfaces.resize_export_surface(scale, offset_extrect);
+        self.render_area = offset_extrect;
+        self.render_area_with_margins = offset_extrect;
+        self.surfaces.update_render_context(offset_extrect, scale);
+
+        self.pending_nodes.push(NodeRenderState {
+            id: *id,
+            visited_children: false,
+            clip_bounds: None,
+            visited_mask: false,
+            mask: false,
+            flattened: false,
+        });
+        self.render_shape_tree_partial_uncached(tree, timestamp, false, true)?;
+
+        self.export_context = None;
+        self.surfaces
+            .flush_and_submit(&mut self.gpu_state, target_surface);
+        let image = self.surfaces.snapshot(target_surface);
+
+        // Restore workspace state.
+        self.focus_mode = saved_focus_mode;
+        self.export_context = saved_export_context;
+        self.render_area = saved_render_area;
+        self.render_area_with_margins = saved_render_area_with_margins;
+        self.current_tile = saved_current_tile;
+        self.pending_nodes = saved_pending_nodes;
+        self.nested_fills = saved_nested_fills;
+        self.nested_blurs = saved_nested_blurs;
+        self.nested_shadows = saved_nested_shadows;
+        self.ignore_nested_blurs = saved_ignore_nested_blurs;
+        self.preview_mode = saved_preview_mode;
+
+        let workspace_scale = self.get_scale();
+        if let Some(tile) = self.current_tile {
+            self.update_render_context(tile);
+        } else if !self.render_area.is_empty() {
+            self.surfaces
+                .update_render_context(self.render_area, workspace_scale);
+        }
+
+        Ok(Some((image, extrect)))
+    }
+
+    /// Retained-mode render loop: for every top-level shape (direct
+    /// child of the root) in paint order, make sure its cached
+    /// subtree image is fresh (capture-on-miss), then blit it on the
+    /// Target surface applying the shape's modifier matrix on top.
+    ///
+    /// This path completely bypasses the tile pipeline and is the
+    /// Penpot analogue of how the SVG renderer composites per-node in
+    /// the browser: each shape is effectively a GPU layer, and
+    /// drag/resize/rotate is just a canvas transform change — no
+    /// rasterization happens until the shape itself is mutated.
+    ///
+    /// The function temporarily suppresses modifiers on `tree` while
+    /// capturing so the snapshot is taken at the shape's base
+    /// position; modifiers are reinstalled before compositing and
+    /// re-applied there as canvas transforms.
+    pub fn render_retained(
+        &mut self,
+        tree: ShapesPoolMutRef,
+        timestamp: i32,
+    ) -> Result<()> {
+        let _start = performance::begin_timed_log!("render_retained");
+        let scale = self.get_scale();
+
+        self.reset_canvas();
+        let dpr = self.options.dpr();
+        let zoom = self.viewbox.zoom * dpr;
+        let pan = (self.viewbox.pan_x * dpr, self.viewbox.pan_y * dpr);
+
+        // Snapshot the list of top-level ids up-front: anything
+        // reachable as a direct child of the root is considered a
+        // retained layer. Order matches paint order.
+        let top_level_ids: Vec<Uuid> = match tree.get(&Uuid::nil()) {
+            Some(root) => root.children_ids_iter_forward(true).copied().collect(),
+            None => return Ok(()),
+        };
+
+        // Evict entries whose shape disappeared from the pool.
+        let live: HashSet<Uuid> = top_level_ids.iter().copied().collect();
+        let stale: Vec<Uuid> = self
+            .shape_cache
+            .iter_ids()
+            .filter(|id| !live.contains(id))
+            .collect();
+        for id in stale {
+            self.shape_cache.remove(&id);
+        }
+
+        // Compute which shapes need a fresh capture and snapshot the
+        // desired capture version *before* we suppress modifiers, so
+        // concurrent mutations can't sneak a wrong version in.
+        let to_capture: Vec<(Uuid, u64)> = top_level_ids
+            .iter()
+            .filter_map(|id| {
+                let v = tree.shape_version(id).unwrap_or(0);
+                if self.shape_cache.is_fresh(id, v, scale) {
+                    None
+                } else {
+                    Some((*id, v))
+                }
+            })
+            .collect();
+
+        // Capture phase — suppress modifiers so snapshots are taken at
+        // each shape's base position. If there was an active gesture
+        // we put the modifiers back immediately afterwards so the
+        // compositor below sees them.
+        let saved_modifiers = if to_capture.is_empty() {
+            HashMap::new()
+        } else {
+            tree.take_modifiers()
+        };
+
+        for (id, version) in &to_capture {
+            // `capture_shape_image` borrows `tree` immutably; we're
+            // holding a `ShapesPoolMutRef` so reborrow as &* for the
+            // call.
+            let capture = self.capture_shape_image(id, &*tree, scale, timestamp)?;
+            match capture {
+                Some((image, source_doc_rect)) => {
+                    self.shape_cache.insert(
+                        *id,
+                        ShapeCacheEntry {
+                            image,
+                            captured_version: *version,
+                            captured_scale: scale,
+                            source_doc_rect,
+                        },
+                    );
+                }
+                None => {
+                    self.shape_cache.remove(id);
+                }
+            }
+        }
+
+        if !saved_modifiers.is_empty() {
+            tree.set_modifiers(saved_modifiers);
+        }
+
+        // Compose on the Target surface in document space. All cached
+        // images already carry the workspace scale baked in, so after
+        // applying zoom*dpr the blit lands at the right size.
+        let canvas = self.surfaces.canvas(SurfaceId::Target);
+        canvas.save();
+        canvas.reset_matrix();
+        // `reset_canvas` clears every intermediate surface but leaves
+        // Target alone; wipe it here so the previous frame's pixels
+        // don't leak through when shapes change position.
+        canvas.clear(self.background_color);
+        canvas.scale((zoom, zoom));
+        canvas.translate(pan);
+
+        // Background fill covering the document viewport (idempotent
+        // after the full-surface clear, but cheap and keeps the code
+        // symmetric with the tile pipeline).
+        let mut bg_paint = skia::Paint::default();
+        bg_paint.set_color(self.background_color);
+        bg_paint.set_style(skia::PaintStyle::Fill);
+        let viewport_rect = self.viewbox.area;
+        if !viewport_rect.is_empty() {
+            canvas.draw_rect(viewport_rect, &bg_paint);
+        }
+
+        let sampling = self.sampling_options;
+        let blit_paint = skia::Paint::default();
+        for id in &top_level_ids {
+            let Some(entry) = self.shape_cache.get(id) else {
+                continue;
+            };
+            let Some(shape) = tree.get(id) else { continue };
+            if shape.hidden() {
+                continue;
+            }
+
+            let modifier = tree.modifier_of(id);
+
+            canvas.save();
+            if let Some(m) = modifier {
+                canvas.concat(&m);
+            }
+            canvas.draw_image_rect_with_sampling_options(
+                &entry.image,
+                None,
+                entry.source_doc_rect,
+                sampling,
+                &blit_paint,
+            );
+            canvas.restore();
+        }
+
+        canvas.restore();
+        self.flush_and_submit();
+        Ok(())
     }
 
     #[inline]
