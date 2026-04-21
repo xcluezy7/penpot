@@ -66,6 +66,41 @@ pub struct NodeRenderState {
     flattened: bool,
 }
 
+/// Mark every shape that satisfies `predicate` as hidden and return the
+/// list of uuids actually toggled so the caller can restore their previous
+/// state with `restore_hidden`. Shapes that were already hidden are left
+/// alone and not included in the returned list.
+fn hide_shapes_with(
+    tree: ShapesPoolMutRef,
+    predicate: impl Fn(&Shape) -> bool,
+) -> Vec<Uuid> {
+    let candidates: Vec<Uuid> = tree.all_ids();
+    let mut toggled = Vec::new();
+    for id in candidates {
+        let Some(shape) = tree.get_mut(&id) else {
+            continue;
+        };
+        if shape.hidden {
+            continue;
+        }
+        if predicate(&*shape) {
+            shape.hidden = true;
+            toggled.push(id);
+        }
+    }
+    toggled
+}
+
+/// Reverses a previous `hide_shapes_with` by clearing the `hidden` flag on
+/// exactly the shapes that call returned.
+fn restore_hidden(tree: ShapesPoolMutRef, toggled: &[Uuid]) {
+    for id in toggled {
+        if let Some(shape) = tree.get_mut(id) {
+            shape.hidden = false;
+        }
+    }
+}
+
 /// Get simplified children of a container, flattening nested flattened containers
 fn get_simplified_children<'a>(tree: ShapesPoolRef<'a>, shape: &'a Shape) -> Vec<Uuid> {
     let mut result = Vec::new();
@@ -1937,22 +1972,30 @@ impl RenderState {
         Ok((data.as_bytes().to_vec(), width, height))
     }
 
-    /// Rasterize each of `ids` into its own `skia::Image` and store the
-    /// snapshots in `self.drag_layers`. The snapshots are taken with the tree
-    /// in its pre-modifier state so that during the drag we can blit them
-    /// transformed by the current modifier matrix without re-rasterizing.
+    /// Rasterize the snapshots used by the SVG-style layered drag path:
     ///
-    /// Must be called from an interactive transform session (`set_modifiers_start`
-    /// has been invoked). The WASM entry point wires the call so the frontend
-    /// does not need to manage layer lifecycles explicitly.
+    ///   * one `DragLayer` image per selected shape,
+    ///   * a `backdrop` image of the viewport with the selected shapes
+    ///     hidden,
+    ///   * an `overlay` image that only contains the shapes that sit above
+    ///     the selection in the z-order (captured on transparent).
     ///
-    /// The state-saving dance mirrors `render_shape_pixels`: it touches the
-    /// Export surface, the render area and the pending-node stack, all of
-    /// which belong to the main workspace render and must not leak.
+    /// The snapshots are taken with the tree in its pre-modifier state so
+    /// that during the drag we can blit them transformed by the current
+    /// modifier matrix without re-rasterizing.
+    ///
+    /// Must be called from an interactive transform session
+    /// (`set_modifiers_start` has been invoked). The WASM entry point wires
+    /// the call so the frontend does not need to manage layer lifecycles
+    /// explicitly.
+    ///
+    /// The tree is borrowed mutably because capturing the backdrop / overlay
+    /// requires toggling `Shape::hidden` on a subset of shapes. The flags
+    /// are restored before this function returns.
     pub fn prepare_drag_layers(
         &mut self,
         ids: &[Uuid],
-        tree: ShapesPoolRef,
+        tree: ShapesPoolMutRef,
     ) -> Result<()> {
         self.drag_layers.clear();
         if ids.is_empty() {
@@ -1973,13 +2016,100 @@ impl RenderState {
         let saved_ignore_nested_blurs = self.ignore_nested_blurs;
         let saved_preview_mode = self.preview_mode;
 
-        // Disable focus mode while rasterizing individual shapes so that a
-        // pre-existing focus filter from the workspace cannot hide the shape
-        // we are trying to snapshot.
+        // Disable focus mode while rasterizing so that a pre-existing focus
+        // filter from the workspace cannot hide the shapes we are trying to
+        // snapshot.
         self.focus_mode.clear();
 
-        let target_surface = SurfaceId::Export;
+        // Per-shape isolated snapshots. Use an immutable reborrow so the
+        // tree is only accessed through `get` for this block; bulk hidden
+        // toggles come later and require the mutable borrow back.
+        {
+            let tree_ref: ShapesPoolRef = tree;
+            self.capture_drag_layer_images(ids, tree_ref, scale)?;
+        }
 
+        // Backdrop + overlay are viewport-sized snapshots. They share the
+        // same destination rect — the viewbox area in document space — and
+        // are sampled 1:1 at `scale`.
+        let viewport_rect = self.viewbox.area;
+        let selected_set: HashSet<Uuid> = ids.iter().copied().collect();
+
+        // --- Backdrop: whole scene with the selected shapes hidden --------
+        let hidden_backdrop = hide_shapes_with(tree, |shape| selected_set.contains(&shape.id));
+        {
+            let tree_ref: ShapesPoolRef = tree;
+            let backdrop = self.capture_viewport_snapshot(
+                tree_ref,
+                viewport_rect,
+                scale,
+                skia::Color::TRANSPARENT,
+            )?;
+            self.drag_layers.backdrop = Some(backdrop);
+        }
+        restore_hidden(tree, &hidden_backdrop);
+
+        // --- Overlay: only the shapes above the selection ----------------
+        // The frontend always sees at least the selection itself above the
+        // backdrop, so we only bother capturing an overlay when there is
+        // something *else* stacked on top.
+        let above_ids = tree.collect_above_of(&selected_set);
+        if !above_ids.is_empty() {
+            let hidden_overlay =
+                hide_shapes_with(tree, |shape| !above_ids.contains(&shape.id));
+            {
+                let tree_ref: ShapesPoolRef = tree;
+                let overlay = self.capture_viewport_snapshot(
+                    tree_ref,
+                    viewport_rect,
+                    scale,
+                    skia::Color::TRANSPARENT,
+                )?;
+                self.drag_layers.overlay = Some(overlay);
+            }
+            restore_hidden(tree, &hidden_overlay);
+        }
+
+        self.drag_layers.viewport_rect = viewport_rect;
+
+        // Restore the workspace render state exactly like `render_shape_pixels`
+        // does. Without this the next workspace render could observe stale
+        // render_area / focus / pending_nodes left over from our snapshots.
+        self.focus_mode = saved_focus_mode;
+        self.export_context = saved_export_context;
+        self.render_area = saved_render_area;
+        self.render_area_with_margins = saved_render_area_with_margins;
+        self.current_tile = saved_current_tile;
+        self.pending_nodes = saved_pending_nodes;
+        self.nested_fills = saved_nested_fills;
+        self.nested_blurs = saved_nested_blurs;
+        self.nested_shadows = saved_nested_shadows;
+        self.ignore_nested_blurs = saved_ignore_nested_blurs;
+        self.preview_mode = saved_preview_mode;
+
+        let workspace_scale = self.get_scale();
+        if let Some(tile) = self.current_tile {
+            self.update_render_context(tile);
+        } else if !self.render_area.is_empty() {
+            self.surfaces
+                .update_render_context(self.render_area, workspace_scale);
+        }
+
+        self.drag_layers.active = true;
+        Ok(())
+    }
+
+    /// Rasterize every id in `ids` into its own `DragLayer` image, sized
+    /// tightly around the shape's extrect. Extracted from
+    /// `prepare_drag_layers` so the borrow of `tree` stays immutable for
+    /// the duration of the loop.
+    fn capture_drag_layer_images(
+        &mut self,
+        ids: &[Uuid],
+        tree: ShapesPoolRef,
+        scale: f32,
+    ) -> Result<()> {
+        let target_surface = SurfaceId::Export;
         for id in ids {
             let Some(shape) = tree.get(id) else {
                 continue;
@@ -2027,32 +2157,68 @@ impl RenderState {
                 source_doc_rect,
             });
         }
+        Ok(())
+    }
 
-        // Restore the workspace render state exactly like `render_shape_pixels`
-        // does. Without this the next workspace render could observe stale
-        // render_area / focus / pending_nodes left over from our snapshots.
-        self.focus_mode = saved_focus_mode;
-        self.export_context = saved_export_context;
-        self.render_area = saved_render_area;
-        self.render_area_with_margins = saved_render_area_with_margins;
-        self.current_tile = saved_current_tile;
-        self.pending_nodes = saved_pending_nodes;
-        self.nested_fills = saved_nested_fills;
-        self.nested_blurs = saved_nested_blurs;
-        self.nested_shadows = saved_nested_shadows;
-        self.ignore_nested_blurs = saved_ignore_nested_blurs;
-        self.preview_mode = saved_preview_mode;
-
-        let workspace_scale = self.get_scale();
-        if let Some(tile) = self.current_tile {
-            self.update_render_context(tile);
-        } else if !self.render_area.is_empty() {
-            self.surfaces
-                .update_render_context(self.render_area, workspace_scale);
+    /// Render the workspace viewport to the Export surface and return its
+    /// snapshot. Assumes `tree` already has the intended `hidden` flags set
+    /// by the caller; this method only drives the render pipeline and does
+    /// not mutate shape state.
+    fn capture_viewport_snapshot(
+        &mut self,
+        tree: ShapesPoolRef,
+        viewport_rect: Rect,
+        scale: f32,
+        clear_color: skia::Color,
+    ) -> Result<skia::Image> {
+        if viewport_rect.is_empty() {
+            return Err(Error::CriticalError(
+                "Cannot capture viewport snapshot on empty rect".to_string(),
+            ));
         }
 
-        self.drag_layers.active = true;
-        Ok(())
+        let target_surface = SurfaceId::Export;
+        let mut extrect = viewport_rect;
+
+        self.export_context = Some((extrect, scale));
+        let margins = self.surfaces.margins();
+        extrect.offset((margins.width as f32 / scale, margins.height as f32 / scale));
+
+        self.surfaces.resize_export_surface(scale, extrect);
+        self.render_area = extrect;
+        self.render_area_with_margins = extrect;
+        self.surfaces.update_render_context(extrect, scale);
+
+        self.surfaces.canvas(target_surface).clear(clear_color);
+
+        // Seed the traversal with every direct child of the invisible root
+        // shape. Mirrors what `render_shape_tree_partial` does for the
+        // workspace render (it pushes root children, not the root itself).
+        self.pending_nodes.clear();
+        let Some(root) = tree.get(&Uuid::nil()) else {
+            return Err(Error::CriticalError(
+                "Root shape not found while capturing viewport snapshot".to_string(),
+            ));
+        };
+        let root_children = root.children_ids(false);
+        self.pending_nodes.extend(root_children.into_iter().map(|id| {
+            NodeRenderState {
+                id,
+                visited_children: false,
+                clip_bounds: None,
+                visited_mask: false,
+                mask: false,
+                flattened: false,
+            }
+        }));
+        self.render_shape_tree_partial_uncached(tree, 0, false, true)?;
+
+        self.export_context = None;
+
+        self.surfaces
+            .flush_and_submit(&mut self.gpu_state, target_surface);
+
+        Ok(self.surfaces.snapshot(target_surface))
     }
 
     /// Release any snapshots created by `prepare_drag_layers`.
@@ -2061,48 +2227,41 @@ impl RenderState {
     }
 
     /// SVG-style layered render path used while the interactive transform is
-    /// active. Instead of walking the shape tree, we:
+    /// active. Three pre-captured images are composited on the Target each
+    /// frame:
     ///
-    ///   1. Paint the persistent atlas as a static backdrop.
-    ///   2. For every snapshot in `drag_layers`, concat the shape's modifier
-    ///      matrix on the Target canvas and blit the image into its original
-    ///      document-space rect. Because the canvas is already in document
-    ///      space (zoom + pan applied), this produces the correct screen-space
-    ///      position with a single draw call per layer and no rasterization.
-    ///   3. Flush the Target.
+    ///   1. `backdrop` — the scene without the selected shapes. Replaces
+    ///      the "atlas + ghost killer" trick: no ghost silhouette, and the
+    ///      shapes that were originally below the selection are preserved.
+    ///   2. `layers` — one image per selected shape, drawn with its current
+    ///      modifier matrix concatenated on the canvas. Because
+    ///      `source_doc_rect` is in document space, a single
+    ///      `draw_image_rect` per layer is enough.
+    ///   3. `overlay` — the shapes that sit above the selection, captured
+    ///      on a transparent background. Drawn last so they keep appearing
+    ///      in front of the dragged shape, matching the original z-order.
     ///
-    /// This is the same trick the browser uses when it composes a dragged
-    /// SVG node: the raster never changes during the gesture, only the
-    /// transform applied to it.
+    /// This is the same trick the browser uses when it composites a dragged
+    /// SVG node: the rasters never change during the gesture, only the
+    /// transform applied to them.
     pub fn render_drag_layered(&mut self, tree: ShapesPoolRef) -> Result<()> {
         let _start = performance::begin_timed_log!("render_drag_layered");
         performance::begin_measure!("render_drag_layered");
 
         self.reset_canvas();
 
-        // Step 1: stable backdrop from the persistent atlas. If the atlas
-        // has not been populated yet we fall through and the target stays
-        // filled with the background color, which is visually acceptable
-        // for the very first drag frame and will be corrected by the
-        // normal render that runs on `set_modifiers_end`.
-        if self.surfaces.has_atlas() {
-            self.surfaces.draw_atlas_to_target(
-                self.viewbox,
-                self.options.dpr(),
-                self.background_color,
-            );
-        }
-
-        // Step 2: compose the drag layers on top.
         let dpr = self.options.dpr();
         let zoom = self.viewbox.zoom * dpr;
         let pan = (self.viewbox.pan_x, self.viewbox.pan_y);
         let sampling = self.sampling_options;
         let background_color = self.background_color;
+        let viewport_rect = self.drag_layers.viewport_rect;
 
         // Collect the data we need up-front: extracting both an immutable
         // borrow of `self.drag_layers` and a mutable borrow of
         // `self.surfaces` at the same time would fight the borrow checker.
+        let backdrop_image = self.drag_layers.backdrop.clone();
+        let overlay_image = self.drag_layers.overlay.clone();
         let draws: Vec<(skia::Image, Rect, Option<Matrix>)> = self
             .drag_layers
             .iter()
@@ -2116,32 +2275,39 @@ impl RenderState {
         canvas.save();
         canvas.reset_matrix();
         // Configure document space on the target canvas: zoom + pan.
-        // After this, drawing at `source_doc_rect` lands where the shape
-        // originally was; the modifier matrix (concat below) moves it.
+        // After this, drawing at `viewport_rect` / `source_doc_rect` lands
+        // where the original pixels were; the modifier matrix (concat
+        // below) moves the selection on top of that.
         canvas.scale((zoom, zoom));
         canvas.translate(pan);
 
-        // Erase the "ghost" of the selected shapes from the atlas backdrop.
-        // The atlas still has them at their pre-drag position; if we just
-        // composed the modifier-transformed layers on top, the user would
-        // see both the original silhouette (from the atlas) and the moved
-        // copy (from the layer). Paint the original extrects with the
-        // background color so the area reads as empty canvas.
-        //
-        // NOTE: this trades visual correctness for simplicity. If a shape
-        // lies on top of other shapes, the covered area will briefly show
-        // background instead of the underlying shapes during the gesture.
-        // A follow-up can replace this with an atlas re-render of those
-        // tiles with the selected shapes marked hidden.
-        let mut clear_paint = skia::Paint::default();
-        clear_paint.set_color(background_color);
-        clear_paint.set_style(skia::PaintStyle::Fill);
-        clear_paint.set_anti_alias(false);
-        for (_, dst, _) in &draws {
-            canvas.draw_rect(*dst, &clear_paint);
+        // Background fill: if the backdrop snapshot fails or the scene was
+        // empty, the viewport still reads as the workspace color instead
+        // of a flash of the previous frame.
+        let mut bg_paint = skia::Paint::default();
+        bg_paint.set_color(background_color);
+        bg_paint.set_style(skia::PaintStyle::Fill);
+        bg_paint.set_anti_alias(false);
+        if !viewport_rect.is_empty() {
+            canvas.draw_rect(viewport_rect, &bg_paint);
         }
 
         let paint = skia::Paint::default();
+
+        // Step 1: backdrop.
+        if let Some(image) = backdrop_image {
+            if !viewport_rect.is_empty() {
+                canvas.draw_image_rect_with_sampling_options(
+                    &image,
+                    None,
+                    viewport_rect,
+                    sampling,
+                    &paint,
+                );
+            }
+        }
+
+        // Step 2: transformed selection layers.
         for (image, dst, modifier) in draws {
             canvas.save();
             if let Some(m) = modifier {
@@ -2155,6 +2321,19 @@ impl RenderState {
                 &paint,
             );
             canvas.restore();
+        }
+
+        // Step 3: overlay (shapes that were above the selection).
+        if let Some(image) = overlay_image {
+            if !viewport_rect.is_empty() {
+                canvas.draw_image_rect_with_sampling_options(
+                    &image,
+                    None,
+                    viewport_rect,
+                    sampling,
+                    &paint,
+                );
+            }
         }
 
         canvas.restore();

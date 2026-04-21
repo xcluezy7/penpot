@@ -946,7 +946,7 @@ pub extern "C" fn set_modifiers() -> Result<()> {
             performance::begin_measure!("prepare_drag_layers");
             state
                 .render_state
-                .prepare_drag_layers(&ids, &state.shapes)?;
+                .prepare_drag_layers(&ids, &mut state.shapes)?;
             performance::end_measure!("prepare_drag_layers");
         }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 
 use crate::performance;
@@ -209,6 +209,62 @@ impl ShapesPoolImpl {
 
     fn clean_shape_cache(&mut self) {
         self.modified_shape_cache.clear()
+    }
+
+    /// Returns every uuid registered in the pool, in arbitrary order.
+    ///
+    /// Used by the drag-layer pipeline to toggle `Shape::hidden` in bulk
+    /// when rendering the backdrop / overlay snapshots.
+    pub fn all_ids(&self) -> Vec<Uuid> {
+        self.uuid_to_idx.keys().copied().collect()
+    }
+
+    /// Collect every shape that sits visually above any of `selected` in
+    /// the tree-render order. Currently we approximate "above" as
+    /// "siblings that come after a selected shape in its parent's child
+    /// list, plus all of their descendants". This matches the common case
+    /// (dragging a shape inside a frame) and, because the overlay is just
+    /// an extra compositing pass, anything we miss simply degrades back to
+    /// the current visual — it never corrupts the atlas.
+    pub fn collect_above_of(&self, selected: &HashSet<Uuid>) -> HashSet<Uuid> {
+        let mut above: HashSet<Uuid> = HashSet::new();
+
+        for sel_id in selected {
+            let Some(shape) = self.get(sel_id) else {
+                continue;
+            };
+            let Some(parent_id) = shape.parent_id else {
+                continue;
+            };
+            let Some(parent) = self.get(&parent_id) else {
+                continue;
+            };
+
+            // `children` stores siblings in paint order (first = behind,
+            // last = in front), so anything after `sel_id` is above it.
+            let Some(pos) = parent.children.iter().position(|c| c == sel_id) else {
+                continue;
+            };
+
+            for sibling_id in parent.children.iter().skip(pos + 1) {
+                if selected.contains(sibling_id) {
+                    // Another selection also participates in the drag. Its
+                    // own layer will be composed on top, so treat it as
+                    // "part of the selected set" rather than overlay.
+                    continue;
+                }
+                above.insert(*sibling_id);
+                if let Some(sibling) = self.get(sibling_id) {
+                    for descendant in sibling.all_children_iter(self, false, false) {
+                        if !selected.contains(&descendant) {
+                            above.insert(descendant);
+                        }
+                    }
+                }
+            }
+        }
+
+        above
     }
 
     /// Returns the raw modifier matrix currently applied to `id`, if any.

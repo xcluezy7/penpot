@@ -33,11 +33,36 @@ pub struct DragLayer {
 /// "composited preview" during interactive transforms.
 ///
 /// When `active` is true, the render loop short-circuits the full tile
-/// rendering pipeline and instead uses the cached images inside `layers`
-/// to present a frame: this matches what a browser does with SVG shapes
-/// during a drag (raster once, transform the raster).
+/// rendering pipeline and instead uses three pre-captured images to compose
+/// every frame:
+///
+///   * `backdrop` — the workspace rendered with the selected shapes hidden.
+///     Sits behind everything and already has the correct pixels for the
+///     "hole" left by the dragged shapes, so we don't need to erase any
+///     ghost silhouette.
+///   * `layers` — per-shape snapshots of the selected shapes in isolation.
+///     Each one is drawn with its current modifier matrix on top of the
+///     backdrop.
+///   * `overlay` — the shapes that sit above the (topmost) selected shape
+///     in the z-order, captured on a transparent background. Drawing it
+///     last restores the original stacking: elements that were in front of
+///     the dragged shape keep being in front during the gesture.
+///
+/// All three images are in document space and share the viewbox rect, so
+/// compositing is `canvas.draw_image_rect(_, viewbox.area)` after setting
+/// the canvas to document coordinates.
 pub struct DragLayers {
     pub layers: Vec<DragLayer>,
+    /// Scene snapshot without the selected shapes. Drawn first each frame.
+    pub backdrop: Option<Image>,
+    /// Snapshot of the shapes that are above the selection on a transparent
+    /// background. Drawn last to preserve z-order. `None` when there is
+    /// nothing above the selection, in which case the overlay step is
+    /// skipped.
+    pub overlay: Option<Image>,
+    /// Document-space rectangle both `backdrop` and `overlay` cover. Matches
+    /// the viewbox area at the moment `prepare` was called.
+    pub viewport_rect: Rect,
     /// Toggled on by `prepare` once snapshots are captured, and off again by
     /// `clear`. The render loop checks this flag before every frame to pick
     /// between the layered fast path and the normal tile pipeline.
@@ -48,12 +73,18 @@ impl DragLayers {
     pub fn new() -> Self {
         Self {
             layers: Vec::new(),
+            backdrop: None,
+            overlay: None,
+            viewport_rect: Rect::new_empty(),
             active: false,
         }
     }
 
     pub fn clear(&mut self) {
         self.layers.clear();
+        self.backdrop = None;
+        self.overlay = None;
+        self.viewport_rect = Rect::new_empty();
         self.active = false;
     }
 
