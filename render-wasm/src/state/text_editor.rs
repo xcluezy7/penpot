@@ -326,6 +326,7 @@ pub struct TextEditorState {
     // selecting something with the pointer.
     pub is_pointer_selection_active: bool,
     pub is_click_event_skipped: bool,
+    pub is_overtype_mode: bool,
     pub active_shape_id: Option<Uuid>,
     pub cursor_visible: bool,
     pub last_blink_time: f64,
@@ -345,6 +346,7 @@ impl TextEditorState {
             has_focus: false,
             is_pointer_selection_active: false,
             is_click_event_skipped: false,
+            is_overtype_mode: false,
             active_shape_id: None,
             cursor_visible: true,
             last_blink_time: 0.0,
@@ -360,6 +362,7 @@ impl TextEditorState {
         self.last_blink_time = 0.0;
         self.selection.reset();
         self.is_pointer_selection_active = false;
+        self.is_overtype_mode = false;
         self.pending_events.clear();
     }
 
@@ -370,6 +373,7 @@ impl TextEditorState {
         self.last_blink_time = 0.0;
         // self.selection.reset();
         self.is_pointer_selection_active = false;
+        self.is_overtype_mode = false;
         self.pending_events.clear();
     }
 
@@ -380,6 +384,7 @@ impl TextEditorState {
         self.last_blink_time = 0.0;
         self.selection.reset();
         self.is_pointer_selection_active = false;
+        self.is_overtype_mode = false;
         self.pending_events.clear();
     }
 
@@ -784,7 +789,7 @@ impl TextEditorState {
         }
 
         let cursor = self.selection.focus;
-        if text_helpers::split_paragraph_at_cursor(text_content, &cursor) {
+        if text_helpers::split_paragraph_at_cursor(text_content, &cursor) && !self.is_overtype_mode {
             let new_cursor =
                 TextPositionWithAffinity::new_without_affinity(cursor.paragraph + 1, 0);
             self.selection.set_caret(new_cursor);

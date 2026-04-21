@@ -377,7 +377,9 @@ pub extern "C" fn text_editor_composition_end() -> Result<()> {
         if let Some(new_cursor) =
             text_helpers::insert_text_with_newlines(text_content, &cursor, &text)
         {
-            state.text_editor_state.selection.set_caret(new_cursor);
+            if !state.text_editor_state.is_overtype_mode {
+                state.text_editor_state.selection.set_caret(new_cursor);
+            }
         }
 
         text_content.layout.paragraphs.clear();
@@ -495,7 +497,9 @@ pub extern "C" fn text_editor_insert_text() -> Result<()> {
         if let Some(new_cursor) =
             text_helpers::insert_text_with_newlines(text_content, &cursor, &text)
         {
-            state.text_editor_state.selection.set_caret(new_cursor);
+            if !state.text_editor_state.is_overtype_mode {
+                state.text_editor_state.selection.set_caret(new_cursor);
+            }
         }
 
         text_content.layout.paragraphs.clear();
