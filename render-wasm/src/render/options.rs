@@ -32,6 +32,7 @@ impl Default for RenderOptions {
             fast_mode: false,
             interactive_transform: false,
             retained_mode: false,
+            // retained_mode: true,
             antialias_threshold: 7.0,
         }
     }

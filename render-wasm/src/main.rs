@@ -387,6 +387,16 @@ pub extern "C" fn set_view_end() -> Result<()> {
             // preview of the old content while new tiles render.
             state.render_state.rebuild_tile_index(&state.shapes);
             state.render_state.surfaces.invalidate_tile_cache();
+
+            // Retained-mode textures captured at the previous zoom
+            // are now resampled every frame (we let them drift
+            // during the gesture); drop the ones that no longer
+            // match the final scale so the next render recaptures
+            // at full resolution.
+            state
+                .render_state
+                .shape_cache
+                .drop_scale_mismatches(scale, 0.0);
         } else {
             // Pure pan at the same zoom level: tile contents have not
             // changed — only the viewport position moved. Update the

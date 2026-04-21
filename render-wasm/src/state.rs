@@ -90,6 +90,23 @@ impl State {
     }
 
     pub fn render_from_cache(&mut self) {
+        if self.render_state.options.is_retained_mode() {
+            // `render_from_cache` is the pan/zoom fast path of the
+            // tile pipeline: it paints the cached atlas/cache surface
+            // under the current viewbox transform. In retained mode
+            // those surfaces are never populated (we don't run the
+            // tile pipeline at all) so what they hold is either empty
+            // or stale from a pre-retained render — either way it
+            // makes shapes appear shifted while panning/zooming.
+            //
+            // Re-composing via `render_retained` is cheap in steady
+            // state: as long as shape versions and scale haven't
+            // changed the cache just blits the pre-rasterized
+            // textures with the new viewbox transform, which is
+            // exactly what render_from_cache tries to approximate.
+            let _ = self.render_state.render_retained(&mut self.shapes, 0);
+            return;
+        }
         self.render_state.render_from_cache(&self.shapes);
     }
 

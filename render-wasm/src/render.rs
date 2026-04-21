@@ -2090,6 +2090,14 @@ impl RenderState {
             self.shape_cache.remove(&id);
         }
 
+        // While a pan/zoom gesture is in flight we deliberately avoid
+        // re-capturing on scale changes: skia will resample the
+        // existing textures during compose (slightly softer for a
+        // few frames) and we reserve the cost of a fresh capture for
+        // after the gesture settles — same strategy the tile
+        // pipeline uses with its cache surface.
+        let allow_scale_drift = self.options.is_fast_mode();
+
         // Compute which shapes need a fresh capture and snapshot the
         // desired capture version *before* we suppress modifiers, so
         // concurrent mutations can't sneak a wrong version in.
@@ -2097,7 +2105,7 @@ impl RenderState {
             .iter()
             .filter_map(|id| {
                 let v = tree.shape_version(id).unwrap_or(0);
-                if self.shape_cache.is_fresh(id, v, scale) {
+                if self.shape_cache.is_fresh(id, v, scale, allow_scale_drift) {
                     None
                 } else {
                     Some((*id, v))
