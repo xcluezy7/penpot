@@ -431,6 +431,10 @@ pub extern "C" fn set_modifiers_end() -> Result<()> {
         let opts = &mut state.render_state.options;
         opts.set_fast_mode(false);
         opts.set_interactive_transform(false);
+        // Release the per-shape snapshots so the next render falls back
+        // to the normal tile pipeline (which will commit the final,
+        // full-quality picture to the atlas).
+        state.render_state.clear_drag_layers();
         state.render_state.cancel_animation_frame();
         performance::end_measure!("set_modifiers_end");
     });
@@ -930,6 +934,22 @@ pub extern "C" fn set_modifiers() -> Result<()> {
     }
 
     with_state_mut!(state, {
+        // Lazily prepare the drag-layer snapshots the first time modifiers
+        // arrive during an interactive transform. We do it here (rather than
+        // inside `set_modifiers_start`) because the snapshots must be taken
+        // with the tree in its pre-modifier state AND we need the concrete
+        // list of shape ids that the gesture touches, which only this call
+        // carries.
+        if state.render_state.options.is_interactive_transform()
+            && state.render_state.drag_layers.is_empty()
+        {
+            performance::begin_measure!("prepare_drag_layers");
+            state
+                .render_state
+                .prepare_drag_layers(&ids, &state.shapes)?;
+            performance::end_measure!("prepare_drag_layers");
+        }
+
         state.set_modifiers(modifiers);
         state.rebuild_modifier_tiles(ids)?;
     });

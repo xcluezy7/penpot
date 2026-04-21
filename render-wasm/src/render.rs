@@ -1,4 +1,5 @@
 mod debug;
+mod drag_layers;
 mod fills;
 pub mod filters;
 mod fonts;
@@ -12,6 +13,8 @@ mod surfaces;
 pub mod text;
 pub mod text_editor;
 mod ui;
+
+pub use drag_layers::{DragLayer, DragLayers};
 
 use skia_safe::{self as skia, Matrix, RRect, Rect};
 use std::borrow::Cow;
@@ -343,6 +346,12 @@ pub(crate) struct RenderState {
     /// Cleared at the beginning of a render pass; set to true after we clear Cache the first
     /// time we are about to blit a tile into Cache for this pass.
     pub cache_cleared_this_render: bool,
+    /// Pre-rasterized snapshots of the shapes currently under an interactive
+    /// transform. When populated the render loop uses the layered fast path
+    /// instead of the tile pipeline: each frame only re-blits the atlas
+    /// backdrop and these images with the shape's modifier applied as a
+    /// canvas transform.
+    pub drag_layers: DragLayers,
 }
 
 pub fn get_cache_size(viewbox: Viewbox, scale: f32) -> skia::ISize {
@@ -416,6 +425,7 @@ impl RenderState {
             preview_mode: false,
             export_context: None,
             cache_cleared_this_render: false,
+            drag_layers: DragLayers::new(),
         })
     }
 
@@ -1664,6 +1674,26 @@ impl RenderState {
         performance::begin_measure!("render");
         performance::begin_measure!("start_render_loop");
 
+        // Layered fast path: while the user is dragging / resizing / rotating
+        // shapes, skip the full tile pipeline entirely and just compose the
+        // cached snapshots on top of the atlas. One GPU draw per layer, no
+        // shape traversal, no tile rasterization.
+        if self.drag_layers.active && !self.drag_layers.is_empty() {
+            // Any in-progress tile work from previous frames would keep
+            // writing to the Target after we present our layered frame,
+            // producing a flicker. Reset the render state so the loop
+            // returns immediately on the next `process_animation_frame`.
+            self.render_in_progress = false;
+            self.pending_nodes.clear();
+            self.pending_tiles.list.clear();
+            self.current_tile = None;
+
+            let _ = base_object;
+            let _ = timestamp;
+            let _ = sync_render;
+            return self.render_drag_layered(tree);
+        }
+
         self.cache_cleared_this_render = false;
         self.reset_canvas();
 
@@ -1905,6 +1935,237 @@ impl RenderState {
         }
 
         Ok((data.as_bytes().to_vec(), width, height))
+    }
+
+    /// Rasterize each of `ids` into its own `skia::Image` and store the
+    /// snapshots in `self.drag_layers`. The snapshots are taken with the tree
+    /// in its pre-modifier state so that during the drag we can blit them
+    /// transformed by the current modifier matrix without re-rasterizing.
+    ///
+    /// Must be called from an interactive transform session (`set_modifiers_start`
+    /// has been invoked). The WASM entry point wires the call so the frontend
+    /// does not need to manage layer lifecycles explicitly.
+    ///
+    /// The state-saving dance mirrors `render_shape_pixels`: it touches the
+    /// Export surface, the render area and the pending-node stack, all of
+    /// which belong to the main workspace render and must not leak.
+    pub fn prepare_drag_layers(
+        &mut self,
+        ids: &[Uuid],
+        tree: ShapesPoolRef,
+    ) -> Result<()> {
+        self.drag_layers.clear();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let scale = self.get_scale();
+
+        let saved_focus_mode = self.focus_mode.clone();
+        let saved_export_context = self.export_context;
+        let saved_render_area = self.render_area;
+        let saved_render_area_with_margins = self.render_area_with_margins;
+        let saved_current_tile = self.current_tile;
+        let saved_pending_nodes = std::mem::take(&mut self.pending_nodes);
+        let saved_nested_fills = std::mem::take(&mut self.nested_fills);
+        let saved_nested_blurs = std::mem::take(&mut self.nested_blurs);
+        let saved_nested_shadows = std::mem::take(&mut self.nested_shadows);
+        let saved_ignore_nested_blurs = self.ignore_nested_blurs;
+        let saved_preview_mode = self.preview_mode;
+
+        // Disable focus mode while rasterizing individual shapes so that a
+        // pre-existing focus filter from the workspace cannot hide the shape
+        // we are trying to snapshot.
+        self.focus_mode.clear();
+
+        let target_surface = SurfaceId::Export;
+
+        for id in ids {
+            let Some(shape) = tree.get(id) else {
+                continue;
+            };
+            if shape.hidden {
+                continue;
+            }
+            let source_doc_rect = shape.extrect(tree, scale);
+            let mut extrect = source_doc_rect;
+
+            self.export_context = Some((extrect, scale));
+            let margins = self.surfaces.margins();
+            extrect.offset((margins.width as f32 / scale, margins.height as f32 / scale));
+
+            self.surfaces.resize_export_surface(scale, extrect);
+            self.render_area = extrect;
+            self.render_area_with_margins = extrect;
+            self.surfaces.update_render_context(extrect, scale);
+
+            self.surfaces
+                .canvas(target_surface)
+                .clear(skia::Color::TRANSPARENT);
+
+            self.pending_nodes.clear();
+            self.pending_nodes.push(NodeRenderState {
+                id: *id,
+                visited_children: false,
+                clip_bounds: None,
+                visited_mask: false,
+                mask: false,
+                flattened: false,
+            });
+            self.render_shape_tree_partial_uncached(tree, 0, false, true)?;
+
+            self.export_context = None;
+
+            self.surfaces
+                .flush_and_submit(&mut self.gpu_state, target_surface);
+
+            let image = self.surfaces.snapshot(target_surface);
+
+            self.drag_layers.push(DragLayer {
+                shape_id: *id,
+                image,
+                source_doc_rect,
+            });
+        }
+
+        // Restore the workspace render state exactly like `render_shape_pixels`
+        // does. Without this the next workspace render could observe stale
+        // render_area / focus / pending_nodes left over from our snapshots.
+        self.focus_mode = saved_focus_mode;
+        self.export_context = saved_export_context;
+        self.render_area = saved_render_area;
+        self.render_area_with_margins = saved_render_area_with_margins;
+        self.current_tile = saved_current_tile;
+        self.pending_nodes = saved_pending_nodes;
+        self.nested_fills = saved_nested_fills;
+        self.nested_blurs = saved_nested_blurs;
+        self.nested_shadows = saved_nested_shadows;
+        self.ignore_nested_blurs = saved_ignore_nested_blurs;
+        self.preview_mode = saved_preview_mode;
+
+        let workspace_scale = self.get_scale();
+        if let Some(tile) = self.current_tile {
+            self.update_render_context(tile);
+        } else if !self.render_area.is_empty() {
+            self.surfaces
+                .update_render_context(self.render_area, workspace_scale);
+        }
+
+        self.drag_layers.active = true;
+        Ok(())
+    }
+
+    /// Release any snapshots created by `prepare_drag_layers`.
+    pub fn clear_drag_layers(&mut self) {
+        self.drag_layers.clear();
+    }
+
+    /// SVG-style layered render path used while the interactive transform is
+    /// active. Instead of walking the shape tree, we:
+    ///
+    ///   1. Paint the persistent atlas as a static backdrop.
+    ///   2. For every snapshot in `drag_layers`, concat the shape's modifier
+    ///      matrix on the Target canvas and blit the image into its original
+    ///      document-space rect. Because the canvas is already in document
+    ///      space (zoom + pan applied), this produces the correct screen-space
+    ///      position with a single draw call per layer and no rasterization.
+    ///   3. Flush the Target.
+    ///
+    /// This is the same trick the browser uses when it composes a dragged
+    /// SVG node: the raster never changes during the gesture, only the
+    /// transform applied to it.
+    pub fn render_drag_layered(&mut self, tree: ShapesPoolRef) -> Result<()> {
+        let _start = performance::begin_timed_log!("render_drag_layered");
+        performance::begin_measure!("render_drag_layered");
+
+        self.reset_canvas();
+
+        // Step 1: stable backdrop from the persistent atlas. If the atlas
+        // has not been populated yet we fall through and the target stays
+        // filled with the background color, which is visually acceptable
+        // for the very first drag frame and will be corrected by the
+        // normal render that runs on `set_modifiers_end`.
+        if self.surfaces.has_atlas() {
+            self.surfaces.draw_atlas_to_target(
+                self.viewbox,
+                self.options.dpr(),
+                self.background_color,
+            );
+        }
+
+        // Step 2: compose the drag layers on top.
+        let dpr = self.options.dpr();
+        let zoom = self.viewbox.zoom * dpr;
+        let pan = (self.viewbox.pan_x, self.viewbox.pan_y);
+        let sampling = self.sampling_options;
+        let background_color = self.background_color;
+
+        // Collect the data we need up-front: extracting both an immutable
+        // borrow of `self.drag_layers` and a mutable borrow of
+        // `self.surfaces` at the same time would fight the borrow checker.
+        let draws: Vec<(skia::Image, Rect, Option<Matrix>)> = self
+            .drag_layers
+            .iter()
+            .map(|layer| {
+                let modifier = tree.get_modifier(&layer.shape_id).copied();
+                (layer.image.clone(), layer.source_doc_rect, modifier)
+            })
+            .collect();
+
+        let canvas = self.surfaces.canvas(SurfaceId::Target);
+        canvas.save();
+        canvas.reset_matrix();
+        // Configure document space on the target canvas: zoom + pan.
+        // After this, drawing at `source_doc_rect` lands where the shape
+        // originally was; the modifier matrix (concat below) moves it.
+        canvas.scale((zoom, zoom));
+        canvas.translate(pan);
+
+        // Erase the "ghost" of the selected shapes from the atlas backdrop.
+        // The atlas still has them at their pre-drag position; if we just
+        // composed the modifier-transformed layers on top, the user would
+        // see both the original silhouette (from the atlas) and the moved
+        // copy (from the layer). Paint the original extrects with the
+        // background color so the area reads as empty canvas.
+        //
+        // NOTE: this trades visual correctness for simplicity. If a shape
+        // lies on top of other shapes, the covered area will briefly show
+        // background instead of the underlying shapes during the gesture.
+        // A follow-up can replace this with an atlas re-render of those
+        // tiles with the selected shapes marked hidden.
+        let mut clear_paint = skia::Paint::default();
+        clear_paint.set_color(background_color);
+        clear_paint.set_style(skia::PaintStyle::Fill);
+        clear_paint.set_anti_alias(false);
+        for (_, dst, _) in &draws {
+            canvas.draw_rect(*dst, &clear_paint);
+        }
+
+        let paint = skia::Paint::default();
+        for (image, dst, modifier) in draws {
+            canvas.save();
+            if let Some(m) = modifier {
+                canvas.concat(&m);
+            }
+            canvas.draw_image_rect_with_sampling_options(
+                &image,
+                None,
+                dst,
+                sampling,
+                &paint,
+            );
+            canvas.restore();
+        }
+
+        canvas.restore();
+
+        // Keep parity with the normal render loop: UI overlay is drawn
+        // on its own surface and composited on the target when we flush.
+        self.flush_and_submit();
+
+        performance::end_measure!("render_drag_layered");
+        performance::end_timed_log!("render_drag_layered", _start);
+        Ok(())
     }
 
     #[inline]

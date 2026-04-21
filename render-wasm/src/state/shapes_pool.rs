@@ -211,6 +211,16 @@ impl ShapesPoolImpl {
         self.modified_shape_cache.clear()
     }
 
+    /// Returns the raw modifier matrix currently applied to `id`, if any.
+    ///
+    /// The `get` method above already returns a shape with modifiers baked in,
+    /// but the drag-layer renderer needs the pure modifier matrix so it can
+    /// apply it as a canvas transform on top of a pre-rasterized snapshot.
+    pub fn get_modifier(&self, id: &Uuid) -> Option<&skia::Matrix> {
+        let idx = self.uuid_to_idx.get(id)?;
+        self.modifiers.get(idx)
+    }
+
     pub fn set_modifiers(&mut self, modifiers: HashMap<Uuid, skia::Matrix>) {
         // Convert HashMap<Uuid, V> to HashMap<usize, V> using indices
         // Initialize the cache cells for affected shapes
