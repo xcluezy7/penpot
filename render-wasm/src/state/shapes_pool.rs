@@ -267,6 +267,57 @@ impl ShapesPoolImpl {
         above
     }
 
+    /// Walk the tree in render order (DFS pre-order, paint-order among
+    /// siblings: first child = behind, last child = in front) and assign a
+    /// monotonically increasing index to every uuid in `targets`. The map
+    /// returned only contains entries for shapes that actually appear in
+    /// the traversal; unknown or detached ids are skipped.
+    ///
+    /// Used by the drag-layer pipeline to blit the per-shape snapshots in
+    /// the same stacking order the workspace would have used, regardless
+    /// of the order in which the frontend sent the selection ids.
+    pub fn render_order_indices(&self, targets: &HashSet<Uuid>) -> HashMap<Uuid, usize> {
+        let mut order = HashMap::with_capacity(targets.len());
+        if targets.is_empty() {
+            return order;
+        }
+
+        let Some(root) = self.get(&Uuid::nil()) else {
+            return order;
+        };
+
+        // DFS with an explicit stack. Push children in reverse so the
+        // iteration pops them in paint order (behind first).
+        // `children_ids_iter_forward` returns a boxed trait object, which
+        // is not `DoubleEndedIterator`, so we collect first and reverse
+        // over the owned `Vec`.
+        let mut stack: Vec<Uuid> = {
+            let children: Vec<Uuid> = root.children_ids_iter_forward(true).copied().collect();
+            children.into_iter().rev().collect()
+        };
+        let mut counter: usize = 0;
+
+        while let Some(id) = stack.pop() {
+            if targets.contains(&id) {
+                order.insert(id, counter);
+                if order.len() == targets.len() {
+                    break;
+                }
+            }
+            counter += 1;
+
+            if let Some(shape) = self.get(&id) {
+                let children: Vec<Uuid> =
+                    shape.children_ids_iter_forward(true).copied().collect();
+                for child in children.into_iter().rev() {
+                    stack.push(child);
+                }
+            }
+        }
+
+        order
+    }
+
     /// Returns the raw modifier matrix currently applied to `id`, if any.
     ///
     /// The `get` method above already returns a shape with modifiers baked in,

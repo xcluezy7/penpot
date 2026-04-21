@@ -2072,6 +2072,17 @@ impl RenderState {
 
         self.drag_layers.viewport_rect = viewport_rect;
 
+        // Sort layers by global render order so the compositing loop paints
+        // the one visually behind first and the one in front last. Without
+        // this, a drag over several selected shapes would swap their
+        // stacking whenever the frontend sent `ids` in a different order.
+        if self.drag_layers.layers.len() > 1 {
+            let order = tree.render_order_indices(&selected_set);
+            self.drag_layers
+                .layers
+                .sort_by_key(|layer| order.get(&layer.shape_id).copied().unwrap_or(usize::MAX));
+        }
+
         // Restore the workspace render state exactly like `render_shape_pixels`
         // does. Without this the next workspace render could observe stale
         // render_area / focus / pending_nodes left over from our snapshots.
