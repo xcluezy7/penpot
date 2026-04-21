@@ -2203,6 +2203,19 @@ impl RenderState {
 
         canvas.restore();
         self.flush_and_submit();
+
+        // The frontend installs a blurred "page transition" overlay on
+        // file open / page switch and keeps it on screen until WASM
+        // dispatches `penpot:wasm:tiles-complete` (see
+        // `start-initial-load-transition!` in `api.cljs`). The legacy
+        // tile pipeline fires that event from `process_animation_frame`
+        // once the last pending tile is flushed; in retained mode we
+        // composite the scene in a single pass here, so we must emit
+        // the same signal ourselves — otherwise the overlay stays up
+        // forever and the canvas looks empty even though the real
+        // render succeeded.
+        wapi::notify_tiles_render_complete!();
+
         Ok(())
     }
 

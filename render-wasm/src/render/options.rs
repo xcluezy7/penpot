@@ -31,8 +31,14 @@ impl Default for RenderOptions {
             dpr: None,
             fast_mode: false,
             interactive_transform: false,
-            retained_mode: false,
-            // retained_mode: true,
+            // Retained-mode (Figma-style per-top-level-shape texture
+            // cache) is ON by default: drag/resize/rotate become
+            // pure canvas transforms over cached textures and
+            // pan/zoom reuses those same textures instead of going
+            // through the tile atlas pipeline. Set to `false` or
+            // call `set_retained_mode_enabled(false)` to fall back to
+            // the legacy tile pipeline for A/B comparisons.
+            retained_mode: true,
             antialias_threshold: 7.0,
         }
     }
