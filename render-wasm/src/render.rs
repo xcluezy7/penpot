@@ -1915,6 +1915,53 @@ impl RenderState {
         Ok((data.as_bytes().to_vec(), width, height))
     }
 
+    /// Capture scale we will actually use to rasterize a shape whose
+    /// extrect covers `rect` at a requested workspace scale of
+    /// `requested_scale`. It may be lower than `requested_scale` at
+    /// extreme zooms, so the allocated Skia surface fits within the
+    /// current GPU texture budget (`gl.MAX_TEXTURE_SIZE`).
+    ///
+    /// Callers use the same helper on both the capture side (to cap
+    /// the rasterization) and the cache-freshness side (so we don't
+    /// treat an already-clamped entry as stale just because the
+    /// requested scale is even higher).
+    pub fn effective_capture_scale(&self, rect: Rect, requested_scale: f32) -> f32 {
+        let margins = self.surfaces.margins;
+        let max_texture_dim = self.surfaces.max_texture_size() as f32;
+        let max_shape_px =
+            (max_texture_dim - (margins.width.max(margins.height) as f32) * 2.0).max(1.0);
+        let longest_side = rect.width().max(rect.height()).max(f32::EPSILON);
+        let max_scale_for_extrect = max_shape_px / longest_side;
+        requested_scale
+            .min(max_scale_for_extrect)
+            .max(f32::EPSILON)
+    }
+
+    /// Drop cache entries whose `captured_scale` no longer matches
+    /// what we would pick *now* for the same shape. Uses
+    /// [`Self::effective_capture_scale`] so entries already clamped
+    /// to the GPU cap are preserved (we can't do any better than
+    /// what we already have), while entries captured at a lower
+    /// legitimate scale — e.g. before a zoom-in — are evicted so the
+    /// next render picks them up crisply again.
+    pub fn evict_stale_scale_entries(&mut self, current_scale: f32) {
+        let mut to_drop: Vec<Uuid> = Vec::new();
+        for id in self.shape_cache.iter_ids().collect::<Vec<_>>() {
+            let Some(entry) = self.shape_cache.get(&id) else {
+                continue;
+            };
+            let expected = self.effective_capture_scale(entry.source_doc_rect, current_scale);
+            // Use a small absolute tolerance to avoid flapping from
+            // f32 rounding when the scale didn't really change.
+            if (entry.captured_scale - expected).abs() > 1e-3 {
+                to_drop.push(id);
+            }
+        }
+        for id in to_drop {
+            self.shape_cache.remove(&id);
+        }
+    }
+
     /// Rasterize `id` and its whole subtree into a standalone
     /// `SkImage`, using the regular render pipeline against the Export
     /// surface. Intended for the retained-mode shape cache: returns the
@@ -1931,7 +1978,7 @@ impl RenderState {
         tree: ShapesPoolRef,
         scale: f32,
         timestamp: i32,
-    ) -> Result<Option<(skia::Image, Rect)>> {
+    ) -> Result<Option<(skia::Image, Rect, f32)>> {
         if tree.len() == 0 {
             return Ok(None);
         }
@@ -1979,8 +2026,22 @@ impl RenderState {
             return Ok(None);
         }
 
-        self.export_context = Some((extrect, scale));
+        // Clamp the capture resolution so the allocated Skia surface
+        // never exceeds the GPU's texture size budget. Without this,
+        // zooming deep in explodes the capture texture past
+        // `GL_MAX_TEXTURE_SIZE`, `new_surface_with_dimensions` returns
+        // `None` and the whole wasm module aborts from inside
+        // `resize_export_surface`.
+        //
+        // The tile pipeline never hits this because it slices the
+        // scene into 512×512 tiles; retained-mode captures the entire
+        // subtree in one go, so at extreme zoom we must fall back to a
+        // lower-resolution snapshot and let Skia upscale it when
+        // compositing (slightly blurrier but correct).
+        let effective_scale = self.effective_capture_scale(extrect, scale);
         let margins = self.surfaces.margins;
+
+        self.export_context = Some((extrect, effective_scale));
         // `render_shape_pixels` offsets the render area by the margins
         // so the intermediate surfaces (Fills/Strokes/shadows) have
         // headroom for background-blur sampling. The offset is NOT a
@@ -1995,14 +2056,19 @@ impl RenderState {
         // top-level shape appears shifted by `margins / scale` units.
         let offset_extrect = {
             let mut r = extrect;
-            r.offset((margins.width as f32 / scale, margins.height as f32 / scale));
+            r.offset((
+                margins.width as f32 / effective_scale,
+                margins.height as f32 / effective_scale,
+            ));
             r
         };
 
-        self.surfaces.resize_export_surface(scale, offset_extrect);
+        self.surfaces
+            .resize_export_surface(effective_scale, offset_extrect);
         self.render_area = offset_extrect;
         self.render_area_with_margins = offset_extrect;
-        self.surfaces.update_render_context(offset_extrect, scale);
+        self.surfaces
+            .update_render_context(offset_extrect, effective_scale);
 
         self.pending_nodes.push(NodeRenderState {
             id: *id,
@@ -2040,7 +2106,7 @@ impl RenderState {
                 .update_render_context(self.render_area, workspace_scale);
         }
 
-        Ok(Some((image, extrect)))
+        Ok(Some((image, extrect, effective_scale)))
     }
 
     /// Retained-mode render loop: for every top-level shape (direct
@@ -2101,17 +2167,40 @@ impl RenderState {
         // Compute which shapes need a fresh capture and snapshot the
         // desired capture version *before* we suppress modifiers, so
         // concurrent mutations can't sneak a wrong version in.
-        let to_capture: Vec<(Uuid, u64)> = top_level_ids
-            .iter()
-            .filter_map(|id| {
-                let v = tree.shape_version(id).unwrap_or(0);
-                if self.shape_cache.is_fresh(id, v, scale, allow_scale_drift) {
-                    None
-                } else {
-                    Some((*id, v))
-                }
-            })
-            .collect();
+        //
+        // We compare against the per-shape *effective* capture scale
+        // (which may be clamped at extreme zoom to fit the GPU
+        // texture budget) instead of the raw workspace scale. Without
+        // this we'd re-capture every frame at high zoom: the capture
+        // returns a clamped scale < workspace scale, `is_fresh` then
+        // sees a scale mismatch, we recapture and get the same clamp,
+        // ad infinitum.
+        let to_capture: Vec<(Uuid, u64)> = {
+            // Reborrow `tree` as an immutable view so we can call
+            // `extrect` (which takes `ShapesPoolRef`) without fighting
+            // the outer `&mut` binding.
+            let pool: ShapesPoolRef = &*tree;
+            top_level_ids
+                .iter()
+                .filter_map(|id| {
+                    let v = pool.shape_version(id).unwrap_or(0);
+                    let effective_scale = match pool.get(id) {
+                        Some(shape) => {
+                            self.effective_capture_scale(shape.extrect(pool, scale), scale)
+                        }
+                        None => scale,
+                    };
+                    if self
+                        .shape_cache
+                        .is_fresh(id, v, effective_scale, allow_scale_drift)
+                    {
+                        None
+                    } else {
+                        Some((*id, v))
+                    }
+                })
+                .collect()
+        };
 
         // Capture phase — suppress modifiers so snapshots are taken at
         // each shape's base position. If there was an active gesture
@@ -2129,13 +2218,18 @@ impl RenderState {
             // call.
             let capture = self.capture_shape_image(id, &*tree, scale, timestamp)?;
             match capture {
-                Some((image, source_doc_rect)) => {
+                // `captured_scale` is the *effective* scale used inside
+                // `capture_shape_image`; it can be lower than the
+                // current workspace scale when we had to clamp the
+                // capture resolution to fit within the GPU texture
+                // budget at extreme zoom.
+                Some((image, source_doc_rect, captured_scale)) => {
                     self.shape_cache.insert(
                         *id,
                         ShapeCacheEntry {
                             image,
                             captured_version: *version,
-                            captured_scale: scale,
+                            captured_scale,
                             source_doc_rect,
                         },
                     );

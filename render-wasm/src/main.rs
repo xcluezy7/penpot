@@ -392,11 +392,11 @@ pub extern "C" fn set_view_end() -> Result<()> {
             // are now resampled every frame (we let them drift
             // during the gesture); drop the ones that no longer
             // match the final scale so the next render recaptures
-            // at full resolution.
-            state
-                .render_state
-                .shape_cache
-                .drop_scale_mismatches(scale, 0.0);
+            // at full resolution. Entries already at the GPU
+            // texture cap are preserved — we can't do any better —
+            // which also prevents an infinite recapture loop at
+            // extreme zoom levels.
+            state.render_state.evict_stale_scale_entries(scale);
         } else {
             // Pure pan at the same zoom level: tile contents have not
             // changed — only the viewport position moved. Update the
