@@ -1977,6 +1977,7 @@ impl RenderState {
         id: &Uuid,
         tree: ShapesPoolRef,
         scale: f32,
+        clip_doc_rect: Option<Rect>,
         timestamp: i32,
     ) -> Result<Option<(skia::Image, Rect, f32)>> {
         if tree.len() == 0 {
@@ -2007,7 +2008,20 @@ impl RenderState {
             .canvas(target_surface)
             .clear(skia::Color::TRANSPARENT);
 
-        let extrect = shape.extrect(tree, scale);
+        let full_extrect = shape.extrect(tree, scale);
+        // When a clip rect is provided (retained-mode ephemeral
+        // capture of a big shape at high zoom), shrink the capture
+        // rect to `extrect ∩ clip`. That keeps the allocated surface
+        // within the GPU texture budget without clamping the capture
+        // scale — the parts of the shape outside the clip simply
+        // aren't needed because they're off-screen anyway.
+        let extrect = match clip_doc_rect {
+            Some(clip) => {
+                let mut r = full_extrect;
+                if r.intersect(clip) { r } else { Rect::new_empty() }
+            }
+            None => full_extrect,
+        };
         // Bail on degenerate geometry to avoid trying to resize a
         // zero-area Export surface.
         if extrect.is_empty() {
@@ -2037,7 +2051,10 @@ impl RenderState {
         // scene into 512×512 tiles; retained-mode captures the entire
         // subtree in one go, so at extreme zoom we must fall back to a
         // lower-resolution snapshot and let Skia upscale it when
-        // compositing (slightly blurrier but correct).
+        // compositing (slightly blurrier but correct).  Callers that
+        // can't tolerate the softening pass a `clip_doc_rect` so the
+        // `extrect` shrinks to the visible portion and the clamp
+        // never needs to kick in.
         let effective_scale = self.effective_capture_scale(extrect, scale);
         let margins = self.surfaces.margins;
 
@@ -2164,9 +2181,11 @@ impl RenderState {
         // pipeline uses with its cache surface.
         let allow_scale_drift = self.options.is_fast_mode();
 
-        // Compute which shapes need a fresh capture and snapshot the
-        // desired capture version *before* we suppress modifiers, so
-        // concurrent mutations can't sneak a wrong version in.
+        // Classify each top-level shape into "cacheable" (fits the
+        // GPU texture budget at workspace scale, so the capture is
+        // pixel-accurate and worth persisting) vs "ephemeral" (would
+        // trigger the scale clamp — we capture just the visible
+        // viewport slice at full resolution and discard afterwards).
         //
         // We compare against the per-shape *effective* capture scale
         // (which may be clamped at extreme zoom to fit the GPU
@@ -2175,54 +2194,74 @@ impl RenderState {
         // returns a clamped scale < workspace scale, `is_fresh` then
         // sees a scale mismatch, we recapture and get the same clamp,
         // ad infinitum.
-        let to_capture: Vec<(Uuid, u64)> = {
+        let (cacheable_to_capture, ephemeral_to_capture): (Vec<(Uuid, u64)>, Vec<(Uuid, u64)>) = {
             // Reborrow `tree` as an immutable view so we can call
             // `extrect` (which takes `ShapesPoolRef`) without fighting
             // the outer `&mut` binding.
             let pool: ShapesPoolRef = &*tree;
-            top_level_ids
-                .iter()
-                .filter_map(|id| {
-                    let v = pool.shape_version(id).unwrap_or(0);
-                    let effective_scale = match pool.get(id) {
-                        Some(shape) => {
-                            self.effective_capture_scale(shape.extrect(pool, scale), scale)
-                        }
-                        None => scale,
-                    };
-                    if self
-                        .shape_cache
-                        .is_fresh(id, v, effective_scale, allow_scale_drift)
-                    {
-                        None
-                    } else {
-                        Some((*id, v))
+            let mut cacheable = Vec::new();
+            let mut ephemeral = Vec::new();
+            for id in &top_level_ids {
+                let v = pool.shape_version(id).unwrap_or(0);
+                let (effective_scale, is_clamped) = match pool.get(id) {
+                    Some(shape) => {
+                        let eff = self.effective_capture_scale(shape.extrect(pool, scale), scale);
+                        // Treat anything below the workspace scale as
+                        // clamped — even tiny drifts would otherwise
+                        // leave the shape looking permanently soft
+                        // once Skia upscales the blit.
+                        (eff, eff < scale - 1e-3)
                     }
-                })
-                .collect()
+                    None => (scale, false),
+                };
+                if is_clamped {
+                    // Ephemeral path only runs outside of interactive
+                    // gestures: during pan/zoom/drag we let the old
+                    // (possibly stale) cache entry stretch so the
+                    // gesture stays responsive, and we re-capture on
+                    // release.
+                    if !allow_scale_drift {
+                        ephemeral.push((*id, v));
+                    }
+                } else if !self
+                    .shape_cache
+                    .is_fresh(id, v, effective_scale, allow_scale_drift)
+                {
+                    cacheable.push((*id, v));
+                }
+            }
+            (cacheable, ephemeral)
         };
+
+        // Drop any persistent entry for shapes that just became
+        // ephemeral — the stored texture was captured at a different
+        // (lower, clamped) resolution and would otherwise leak into
+        // the viewport-clipped compose path.
+        for (id, _) in &ephemeral_to_capture {
+            self.shape_cache.remove(id);
+        }
 
         // Capture phase — suppress modifiers so snapshots are taken at
         // each shape's base position. If there was an active gesture
         // we put the modifiers back immediately afterwards so the
         // compositor below sees them.
-        let saved_modifiers = if to_capture.is_empty() {
-            HashMap::new()
-        } else {
+        let needs_capture =
+            !cacheable_to_capture.is_empty() || !ephemeral_to_capture.is_empty();
+        let saved_modifiers = if needs_capture {
             tree.take_modifiers()
+        } else {
+            HashMap::new()
         };
 
-        for (id, version) in &to_capture {
+        for (id, version) in &cacheable_to_capture {
             // `capture_shape_image` borrows `tree` immutably; we're
             // holding a `ShapesPoolMutRef` so reborrow as &* for the
             // call.
-            let capture = self.capture_shape_image(id, &*tree, scale, timestamp)?;
+            let capture = self.capture_shape_image(id, &*tree, scale, None, timestamp)?;
             match capture {
                 // `captured_scale` is the *effective* scale used inside
-                // `capture_shape_image`; it can be lower than the
-                // current workspace scale when we had to clamp the
-                // capture resolution to fit within the GPU texture
-                // budget at extreme zoom.
+                // `capture_shape_image`; for cacheable shapes it
+                // equals the workspace scale by construction.
                 Some((image, source_doc_rect, captured_scale)) => {
                     self.shape_cache.insert(
                         *id,
@@ -2240,7 +2279,34 @@ impl RenderState {
             }
         }
 
-        if !saved_modifiers.is_empty() {
+        // Ephemeral captures: only the `extrect ∩ viewport` slice is
+        // rendered, which keeps the texture inside the GPU budget
+        // even at extreme zoom levels. We reuse `ShapeCache` as the
+        // hand-off channel into the compose loop and evict the entry
+        // immediately after compositing so the next frame (which may
+        // have a different pan) can capture afresh.
+        let viewport_doc = self.viewbox.area;
+        let mut ephemeral_capture_ids: Vec<Uuid> = Vec::new();
+        if !ephemeral_to_capture.is_empty() && !viewport_doc.is_empty() {
+            for (id, version) in &ephemeral_to_capture {
+                let capture =
+                    self.capture_shape_image(id, &*tree, scale, Some(viewport_doc), timestamp)?;
+                if let Some((image, source_doc_rect, captured_scale)) = capture {
+                    self.shape_cache.insert(
+                        *id,
+                        ShapeCacheEntry {
+                            image,
+                            captured_version: *version,
+                            captured_scale,
+                            source_doc_rect,
+                        },
+                    );
+                    ephemeral_capture_ids.push(*id);
+                }
+            }
+        }
+
+        if needs_capture {
             tree.set_modifiers(saved_modifiers);
         }
 
@@ -2297,6 +2363,15 @@ impl RenderState {
 
         canvas.restore();
         self.flush_and_submit();
+
+        // Drop the short-lived ephemeral entries now that they've been
+        // blitted. Keeping them would break panning at extreme zoom:
+        // the stored `source_doc_rect` only covers the previous
+        // viewport slice, so the next frame would show stale content
+        // where the viewport moved.
+        for id in &ephemeral_capture_ids {
+            self.shape_cache.remove(id);
+        }
 
         // The frontend installs a blurred "page transition" overlay on
         // file open / page switch and keeps it on screen until WASM
