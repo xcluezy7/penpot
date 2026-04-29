@@ -1,18 +1,36 @@
 # AI Agent Guide
 
+## MANDATORY: Use td for Task Management
+
+Run td usage --new-session at conversation start (or after /clear). This tells you what to work on next.
+
+Sessions are automatic (based on terminal/agent context). Optional:
+- td session "name" to label the current session
+- td session --new to force a new session in the same context
+
+Use td usage -q after first read.
+
 This document provides the core context and operating guidelines for AI agents
 working in this repository.
+
+## Full Repository Context
+
+For a complete technical overview of the Penpot codebase — including all
+modules, their stacks, key files, dependencies, build commands, and conventions
+— see [**context.md**](context.md). Load this file at the start of any session
+to gain full project awareness before working on tasks.
 
 ## Before You Start
 
 Before responding to any user request, you must:
 
-1. Read this file completely.
-2. Identify which modules are affected by the task.
-3. Load the `AGENTS.md` file **only** for each affected module (see the
+1. Read [context.md](context.md) for the full repository context.
+2. Read this file completely.
+3. Identify which modules are affected by the task.
+4. Load the `AGENTS.md` file **only** for each affected module (see the
    architecture table below). Not all modules have an `AGENTS.md` — verify the
    file exists before attempting to read it.
-4. Do **not** load `AGENTS.md` files for unrelated modules.
+5. Do **not** load `AGENTS.md` files for unrelated modules.
 
 ## Role: Senior Software Engineer
 

@@ -1,10 +1,11 @@
+import { DesignTaskHandler } from "./task-handlers/DesignTaskHandler";
 import { ExecuteCodeTaskHandler } from "./task-handlers/ExecuteCodeTaskHandler";
 import { Task, TaskHandler } from "./TaskHandler";
 
 /**
  * Registry of all available task handlers.
  */
-const taskHandlers: TaskHandler[] = [new ExecuteCodeTaskHandler()];
+const taskHandlers: TaskHandler[] = [new ExecuteCodeTaskHandler(), new DesignTaskHandler()];
 
 // Determine whether multi-user mode is enabled based on build-time configuration
 declare const IS_MULTI_USER_MODE: boolean;

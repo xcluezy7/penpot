@@ -15,8 +15,7 @@
   :jvm-repl
   {:extra-deps
    {com.bhauman/rebel-readline {:mvn/version "RELEASE"}}
-   :main-opts ["-m" "rebel-readline.main"]
-   :jvm-opts ["--sun-misc-unsafe-memory-access=allow"]}
+   :main-opts ["-m" "rebel-readline.main"]}
 
   :dev
   {:extra-paths ["dev"]
@@ -27,6 +26,5 @@
     criterium/criterium {:mvn/version "RELEASE"}}}
 
   :shadow-cljs
-  {:main-opts ["-m" "shadow.cljs.devtools.cli"]
-   :jvm-opts ["--sun-misc-unsafe-memory-access=allow"]}
+  {:main-opts ["-m" "shadow.cljs.devtools.cli"]}
   }}
