@@ -23,6 +23,118 @@
   padding: deprecated.$s-4 deprecated.$s-6;
 }
 
+.bridge-status-section {
+  display: flex;
+  align-items: center;
+}
+
+.ask-agent-section {
+  display: flex;
+  align-items: center;
+}
+
+.agent-bridge-status {
+  @extend .button-tertiary;
+  display: inline-flex;
+  align-items: center;
+  gap: deprecated.$s-6;
+  min-height: deprecated.$s-28;
+  padding: 0 deprecated.$s-8;
+  border-radius: deprecated.$br-8;
+  color: var(--button-tertiary-foreground-color-rest);
+
+  &.connected {
+    color: var(--status-widget-icon-foreground-color);
+  }
+
+  &.degraded,
+  &.checking,
+  &.unreachable {
+    color: var(--button-tertiary-foreground-color-hover);
+  }
+}
+
+.agent-bridge-dot {
+  width: deprecated.$s-8;
+  height: deprecated.$s-8;
+  border-radius: 50%;
+  background-color: var(--status-widget-background-color-pending);
+
+  .connected & {
+    background-color: var(--status-widget-background-color-success);
+  }
+
+  .degraded &,
+  .checking & {
+    background-color: var(--status-widget-background-color-warning);
+  }
+
+  .unreachable & {
+    background-color: var(--status-widget-background-color-error);
+  }
+}
+
+.agent-bridge-label,
+.agent-bridge-meta {
+  @include deprecated.bodySmallTypography;
+  white-space: nowrap;
+}
+
+.agent-bridge-meta {
+  opacity: 0.8;
+}
+
+.ask-agent-bar,
+.ask-agent-form {
+  display: inline-flex;
+  align-items: center;
+  gap: deprecated.$s-6;
+}
+
+.ask-agent-toggle,
+.ask-agent-submit,
+.ask-agent-cancel {
+  @extend .button-tertiary;
+  min-height: deprecated.$s-28;
+  padding: 0 deprecated.$s-8;
+  border-radius: deprecated.$br-8;
+}
+
+.ask-agent-input {
+  min-width: deprecated.$s-160;
+  min-height: deprecated.$s-28;
+  padding: 0 deprecated.$s-8;
+  border-radius: deprecated.$br-8;
+  border: 1px solid var(--input-border-color, var(--color-gray-30));
+  background-color: var(--input-background-color, var(--panel-background-color));
+  color: var(--input-foreground-color, var(--color-foreground-primary));
+}
+
+.ask-agent-status {
+  @include deprecated.bodySmallTypography;
+  margin-inline-start: deprecated.$s-6;
+
+  &.pending {
+    color: var(--status-widget-background-color-warning);
+  }
+
+  &.accepted {
+    color: var(--status-widget-background-color-success);
+  }
+
+  &.failed {
+    color: var(--status-widget-background-color-error);
+  }
+}
+
+.ask-agent-action-task {
+  opacity: 0.8;
+}
+
+.ask-agent-action-label {
+  opacity: 0.8;
+}
+
 .separator {
   flex: 1;
 }

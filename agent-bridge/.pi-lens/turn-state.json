@@ -1,0 +1,171 @@
+{
+  "files": {
+    "src/index.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 119
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:12:22.471Z"
+    },
+    "src/config.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 59
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T20:08:08.505Z"
+    },
+    "src/logger.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 40
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T20:08:08.505Z"
+    },
+    "src/health.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 65
+        }
+      ],
+      "importsChanged": false,
+      "lastEdit": "2026-04-27T20:08:08.506Z"
+    },
+    "src/penpot/protocol.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 104
+        }
+      ],
+      "importsChanged": false,
+      "lastEdit": "2026-04-27T21:06:12.231Z"
+    },
+    "src/penpot/canvas-state.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 188
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:06:12.238Z"
+    },
+    "src/penpot/ws-client.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 251
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:06:12.239Z"
+    },
+    "src/agents/types.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 124
+        }
+      ],
+      "importsChanged": false,
+      "lastEdit": "2026-04-27T21:06:39.245Z"
+    },
+    "src/agents/agent-session.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 84
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:06:39.246Z"
+    },
+    "src/agents/connection-manager.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 229
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:06:39.249Z"
+    },
+    "src/agents/openclaw-adapter.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 147
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:07:13.855Z"
+    },
+    "src/agents/pi-agent-adapter.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 135
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-27T21:07:13.856Z"
+    },
+    "test/anti-slop-reviewer.test.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 141
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-29T02:49:09.230Z"
+    },
+    "src/skills/built-in/checklists/quality-checklist.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 319
+        }
+      ],
+      "importsChanged": false,
+      "lastEdit": "2026-04-29T02:50:26.386Z"
+    },
+    "src/skills/built-in/anti-slop-reviewer.ts": {
+      "modifiedRanges": [
+        {
+          "start": 1,
+          "end": 44
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-29T02:50:40.708Z"
+    },
+    "src/skills/built-in/index.ts": {
+      "modifiedRanges": [
+        {
+          "start": 2,
+          "end": 2
+        },
+        {
+          "start": 7,
+          "end": 7
+        }
+      ],
+      "importsChanged": true,
+      "lastEdit": "2026-04-29T02:51:01.704Z"
+    }
+  },
+  "turnCycles": 0,
+  "maxCycles": 3,
+  "lastUpdated": "2026-04-29T02:51:01.704Z"
+}

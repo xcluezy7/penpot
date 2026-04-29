@@ -25,6 +25,8 @@
    [app.main.ui.exports.assets :refer [progress-widget]]
    [app.main.ui.formats :as fmt]
    [app.main.ui.icons :as deprecated-icon]
+   [app.main.ui.workspace.agent-bridge-status :refer [agent-bridge-status*]]
+   [app.main.ui.workspace.ask-agent-bar :refer [ask-agent-bar*]]
    [app.main.ui.workspace.presence :refer [active-sessions]]
    [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer [tr]]
@@ -199,6 +201,12 @@
     [:div {:class (stl/css :workspace-header-right)}
      [:div {:class (stl/css :users-section)}
       [:& active-sessions]]
+
+     [:div {:class (stl/css :bridge-status-section)}
+      [:& agent-bridge-status*]]
+
+     [:div {:class (stl/css :ask-agent-section)}
+      [:& ask-agent-bar*]]
 
      [:& progress-widget]
 

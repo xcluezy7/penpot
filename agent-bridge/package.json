@@ -1,0 +1,45 @@
+{
+  "name": "agent-bridge",
+  "version": "1.0.0",
+  "description": "Agent Bridge — real-time agent-human collaboration service for Penpot",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "pnpm run build:types && esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/index.js --external:express --external:ws --external:pino --external:pino-pretty --external:zod",
+    "build:types": "tsc --emitDeclarationOnly --outDir dist",
+    "start": "node dist/index.js",
+    "start:dev": "pnpm exec tsx src/index.ts",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "types:check": "tsc --noEmit",
+    "clean": "rm -rf dist/"
+  },
+  "keywords": [
+    "penpot",
+    "agent-bridge",
+    "multi-agent",
+    "design-tool"
+  ],
+  "author": "Slop-Less",
+  "license": "MPL-2.0",
+  "packageManager": "pnpm@10.33.0",
+  "dependencies": {
+    "express": "^5.1.0",
+    "pino": "^9.10.0",
+    "pino-pretty": "^13.1.1",
+    "ws": "^8.18.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.25.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.0"
+  },
+  "ts-node": {
+    "esm": true
+  }
+}

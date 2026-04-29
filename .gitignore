@@ -84,3 +84,5 @@
 /**/node_modules
 /**/.yarn/*
 /.pnpm-store
+.todos/
+agent-bridge/node_modules/\nagent-bridge/dist/
