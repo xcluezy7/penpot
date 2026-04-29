@@ -55,8 +55,5 @@
 
   :shadow-cljs
   {:main-opts ["-m" "shadow.cljs.devtools.cli"]
-   :jvm-opts ["--sun-misc-unsafe-memory-access=allow"
-              "-Dpenpot.wasm.profile-marks=true"
-              "-XX:+UnlockExperimentalVMOptions"
-              "-XX:CompileCommand=blackhole,criterium.blackhole.Blackhole::consume"]}
+   :jvm-opts ["-Dpenpot.wasm.profile-marks=true"]}
   }}

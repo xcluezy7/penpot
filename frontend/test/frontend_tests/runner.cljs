@@ -2,6 +2,8 @@
   (:require
    [cljs.test :as t]
    [frontend-tests.basic-shapes-test]
+   [frontend-tests.data.agent-bridge-status-test]
+   [frontend-tests.data.agent-requests-test]
    [frontend-tests.data.repo-test]
    [frontend-tests.data.viewer-test]
    [frontend-tests.data.workspace-colors-test]
@@ -42,6 +44,8 @@
   []
   (t/run-tests
    'frontend-tests.basic-shapes-test
+   'frontend-tests.data.agent-bridge-status-test
+   'frontend-tests.data.agent-requests-test
    'frontend-tests.data.repo-test
    'frontend-tests.errors-test
    'frontend-tests.main-errors-test
