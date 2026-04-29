@@ -85,4 +85,23 @@
 /**/.yarn/*
 /.pnpm-store
 .todos/
-agent-bridge/node_modules/\nagent-bridge/dist/
+
+# AI tooling config directories
+.agents/
+.augment/
+.claude/
+.context/
+.goose/
+.junie/
+.mux/
+.pi-lens/
+.pi/
+
+# Build artifacts
+mcp/packages/common/src/types.d.ts
+mcp/packages/common/src/types.d.ts.map
+mcp/packages/server/.pi-lens/
+skills-lock.json
+frontend/mise.toml
+agent-bridge/node_modules/
+agent-bridge/dist/
