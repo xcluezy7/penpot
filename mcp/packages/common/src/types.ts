@@ -83,3 +83,34 @@ export interface ExecuteCodeTaskResultData<T> {
      */
     log: string;
 }
+
+/**
+ * Parameters for the createAgentMarker task.
+ *
+ * Creates a small visible marker on the current page so agent actions
+ * can be verified in the workspace.
+ */
+export interface CreateAgentMarkerTaskParams {
+    /** Label shown in the created marker/text. */
+    label: string;
+
+    /** Original prompt that triggered the action. */
+    prompt: string;
+
+    /** Optional explicit viewport-relative position. */
+    x?: number;
+    y?: number;
+
+    /** Marker dimensions. */
+    width?: number;
+    height?: number;
+}
+
+/**
+ * Result data for the createAgentMarker task.
+ */
+export interface CreateAgentMarkerTaskResultData {
+    shapeName: string;
+    createdShapeId?: string;
+    createdTextId?: string;
+}

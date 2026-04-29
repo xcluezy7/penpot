@@ -170,3 +170,39 @@ services:
         aliases:
           - ldap
 
+
+  agent-bridge:
+    build:
+      context: "../../agent-bridge"
+    container_name: "penpot-devenv-agent-bridge"
+    restart: always
+    stop_signal: SIGINT
+
+    depends_on:
+      - main
+
+    ports:
+      - "4501:4401"
+      - "4502:4402"
+
+    environment:
+      - PORT=4401
+      - HOST=0.0.0.0
+      - PENPOT_BACKEND_URL=http://main:3448
+      - PENPOT_WS_URL=ws://main:3448
+      - MCP_PLUGIN_URL=http://main:4400
+      - AGENT_WS_PORT=4402
+      - LOG_LEVEL=info
+      - NODE_ENV=development
+
+    networks:
+      default:
+        aliases:
+          - agent-bridge
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4401/health').then(r=>{if(r.status!==200)throw new Error(r.status);else process.exit(0)})"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
